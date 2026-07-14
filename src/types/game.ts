@@ -183,6 +183,12 @@ export interface CalibrationProfile {
     torsoToShoulderRatio: number;
     confidence: number;
     sampleCount: number;
+    /** Number of samples with a directly observed two-ear span. */
+    earSpanSampleCount?: number;
+    /** Stable runtime tracklet sealed by the collector before atomic locking. */
+    headTrackletId?: number;
+    /** Geometry used to seal the identity when ear span was intermittent. */
+    source?: 'ear-span' | 'shoulder-torso-fallback';
   };
   hipCenter?: { x: number; y: number };
   hipWidth?: number;
@@ -199,8 +205,10 @@ export interface InitializeVisionRequest {
   gpuModelPath?: string;
   /** Two registered players plus one spectator candidate on the GPU. */
   maxPoses: 2 | 3;
-  /** CPU startup is capped at two; healthy recognition rescue may configure three later. */
-  cpuMaxPoses?: 2;
+  /** Explicit model intent; omitted only by older fixtures/workers. */
+  modelPreference?: 'auto' | 'lite' | 'full';
+  /** CPU uses Lite while retaining the selected preset's candidate limit. */
+  cpuMaxPoses?: 2 | 3;
   /** Used after a GPU runtime timeout so recovery cannot retry the same backend. */
   forceBackend?: 'cpu';
 }
@@ -259,6 +267,9 @@ export interface VisionPerformanceMetrics {
   /** Present in the current worker; optional for old persisted test fixtures. */
   maxPoses?: 2 | 3;
   modelTier?: 'lite' | 'full';
+  /** Runtime target that produced this frame, for operator diagnostics. */
+  targetFps?: 15 | 20 | 24 | 30;
+  maximumInputDimension?: 512 | 640 | 768 | 960;
   adaptiveMode?:
     | 'gpu-quality'
     | 'gpu-recognition-rescue'

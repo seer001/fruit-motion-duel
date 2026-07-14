@@ -24,6 +24,9 @@ test('首頁呈現隱私、設備與三種遊戲入口', async ({ page }) => {
     timeout: 20_000,
   });
   await expect(page.getByText('使用 iPhone 16 Pro 鏡頭')).toBeVisible();
+  await expect(page.locator('.game-layer')).toHaveAttribute('data-renderer-state', 'absent');
+  await expect(page.locator('.game-layer canvas')).toHaveCount(0);
+  await expect(page.locator('#app')).toHaveAttribute('data-auto-performance-stage', '0');
 });
 
 test('鏡頭清單會優先顯示 iPhone 接續互通相機', async ({ page }) => {
@@ -67,6 +70,33 @@ test('鏡頭清單會優先顯示 iPhone 接續互通相機', async ({ page }) =
   await expect(page.getByText('已找到 iPhone 接續互通相機')).toBeVisible();
 });
 
+test('效能設定可保存、重整並恢復 Auto', async ({ page }) => {
+  await expect(page.getByText('✓ 多關節姿態模型已離線載入')).toBeVisible({ timeout: 20_000 });
+  await page.getByText('效能優先', { exact: true }).click();
+  await expect(page.locator('input[name="performancePreset"][value="performance"]')).toBeChecked();
+  await page.getByText('進階單項設定', { exact: true }).click();
+  await page.getByLabel('遊戲後方顯示攝影機').uncheck();
+  await page.getByRole('button', { name: '套用效能設定' }).click();
+
+  await expect(page.locator('input[name="performancePreset"][value="performance"]')).toBeChecked();
+  await expect(page.getByLabel('遊戲後方顯示攝影機')).not.toBeChecked();
+  await expect(page.locator('#app')).toHaveAttribute('data-css-blur', 'false');
+  await expect(page.locator('#app')).toHaveAttribute('data-auto-performance-stage', 'fixed');
+  await expect(page.locator('.game-layer')).toHaveAttribute('data-renderer-state', 'absent');
+
+  await page.reload();
+  await expect(page.locator('input[name="performancePreset"][value="performance"]')).toBeChecked();
+  await expect(page.getByLabel('遊戲後方顯示攝影機')).not.toBeChecked();
+
+  await page.getByRole('button', { name: '恢復自動設定' }).click();
+  await expect(page.locator('input[name="performancePreset"][value="auto"]')).toBeChecked();
+  await expect(page.locator('#app')).toHaveAttribute('data-css-blur', 'true');
+  await expect(page.locator('#app')).toHaveAttribute('data-auto-performance-stage', '0');
+  expect(await page.evaluate(() =>
+    localStorage.getItem('body-fruit-duel:performance-settings:v1'),
+  )).toBeNull();
+});
+
 test('滑鼠示範可設定單人練習並進入單人校正', async ({ page }) => {
   await enableMouseDemo(page);
   await page.getByRole('button', { name: '開始練習' }).click();
@@ -83,6 +113,7 @@ test('滑鼠示範可設定單人練習並進入單人校正', async ({ page }) 
   await expect(page.getByRole('heading', { name: '果影' })).toBeVisible();
   await expect(page.getByText('左手主手 · 坐姿')).toBeVisible();
   await expect(page.locator('.calibration-player')).toHaveCount(1);
+  await expect(page.locator('.game-layer')).toHaveAttribute('data-renderer-state', 'absent');
   const start = page.getByRole('button', { name: '示範模式直接開始' });
   await expect(start).toBeEnabled();
   await start.click();
@@ -94,6 +125,12 @@ test('滑鼠示範可設定單人練習並進入單人校正', async ({ page }) 
   await expect(page.locator('#app')).toHaveClass(/is-solo-arena/);
   const hostDockBox = await page.locator('.host-dock').boundingBox();
   expect(hostDockBox?.height).toBeLessThan(120);
+  await expect(page.locator('.game-layer')).toHaveAttribute('data-renderer-state', 'awake');
+  await expect(page.locator('.game-layer canvas')).toHaveCount(1);
+
+  await page.getByRole('button', { name: '結束遊戲' }).click();
+  await expect(page.getByRole('heading', { name: '單人練習設定' })).toBeVisible();
+  await expect(page.locator('.game-layer')).toHaveAttribute('data-renderer-state', 'sleeping');
 });
 
 test('攝影機權限被拒時保留在安全啟動頁並顯示可恢復提示', async ({ page }) => {

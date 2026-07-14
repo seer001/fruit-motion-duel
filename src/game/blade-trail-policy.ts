@@ -1,4 +1,9 @@
 import type { DominantHand, Lane, SliceTrail } from '../types/game';
+import { DUAL_LANE_REGIONS } from '../config/lanes';
+
+// SliceTrail points have already been mapped onto FruitDuelGame's logical
+// 1920×1080 scoring canvas before they reach this boundary.
+const LOGICAL_SCORING_WIDTH = 1920;
 
 export interface BladeOwnerPolicy {
   participantId: string;
@@ -21,6 +26,32 @@ function preferTrail(current: SliceTrail | undefined, candidate: SliceTrail): Sl
   return candidate.confidence > current.confidence ? candidate : current;
 }
 
+function isOnScoringSide(lane: Lane, x: number): boolean {
+  if (!Number.isFinite(x)) return false;
+  return lane === 'left'
+    ? x < DUAL_LANE_REGIONS.center.minX * LOGICAL_SCORING_WIDTH
+    : x > DUAL_LANE_REGIONS.center.maxX * LOGICAL_SCORING_WIDTH;
+}
+
+/**
+ * Removes every segment before the most recent centre/opponent excursion.
+ * A single re-entry sample is deliberately retained: it can render the blade,
+ * but collision requires a subsequent same-side sample to form a segment.
+ */
+function ownScoringSideSuffix(trail: SliceTrail, lane: Lane): SliceTrail | null {
+  const latest = trail.points.at(-1);
+  if (!latest || !isOnScoringSide(lane, latest.x)) return null;
+
+  let suffixStart = trail.points.length - 1;
+  while (suffixStart > 0) {
+    const previous = trail.points[suffixStart - 1];
+    if (!previous || !isOnScoringSide(lane, previous.x)) break;
+    suffixStart -= 1;
+  }
+  if (suffixStart === 0) return trail;
+  return { ...trail, points: trail.points.slice(suffixStart) };
+}
+
 /**
  * Enforces the gameplay contract at the rendering/collision boundary: every
  * enrolled participant owns exactly one blade, and it must be their configured
@@ -41,9 +72,12 @@ export function selectActiveBladeTrails(
   }
 
   // Owner order is stable even if MediaPipe returns candidates in a new order.
-  return owners.flatMap(({ participantId }) => {
+  return owners.flatMap(({ participantId, lane }) => {
     const trail = selected.get(participantId);
-    return trail ? [trail] : [];
+    if (!trail) return [];
+    if (owners.length !== 2) return [trail];
+    const safeTrail = ownScoringSideSuffix(trail, lane);
+    return safeTrail ? [safeTrail] : [];
   });
 }
 

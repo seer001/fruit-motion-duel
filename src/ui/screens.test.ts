@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Participant, ScoreBreakdown } from '../types/game';
+import { getPerformancePresetSettings } from '../config/performance';
 import {
   calibrationScreen,
   casualSetupScreen,
@@ -16,6 +17,15 @@ const PLAYER: Participant = {
   posture: 'seated',
   rankingEligible: false,
   createdAt: 1,
+};
+
+const RIGHT_PLAYER: Participant = {
+  id: 'duel-2',
+  displayName: '果刃',
+  activeHand: 'right',
+  posture: 'standing',
+  rankingEligible: true,
+  createdAt: 2,
 };
 
 const SCORE: ScoreBreakdown = {
@@ -48,6 +58,8 @@ describe('single-player practice screens', () => {
     });
     expect(home).toContain('id="choose-solo-practice"');
     expect(home).toContain('單人練習');
+    expect(home).toContain('id="performance-settings-form"');
+    expect(home).toContain('name="performancePreset" value="auto" checked');
 
     const setup = soloPracticeSetupScreen({
       playerName: PLAYER.displayName,
@@ -103,6 +115,87 @@ describe('single-player practice screens', () => {
     expect(markup).toContain('最長連擊');
     expect(markup).toContain('同設定再練一次');
     expect(markup).toContain('不計入正式賽排名');
+  });
+});
+
+describe('calibration diagnostics screen', () => {
+  it('renders independent recognition and performance cards with per-side diagnostics', () => {
+    const markup = calibrationScreen(
+      [
+        { participant: PLAYER, lane: 'left', progress: 1 },
+        { participant: RIGHT_PLAYER, lane: 'right', progress: 0.5 },
+      ],
+      { halfLabel: '第一小局', demoMode: false },
+    );
+
+    for (const selector of [
+      'data-player-lane-candidates',
+      'data-player-samples',
+      'data-player-ears',
+      'data-player-fallback',
+      'data-player-identity',
+      'data-player-hand',
+    ]) {
+      expect(markup.match(new RegExp(selector, 'g')) ?? []).toHaveLength(2);
+    }
+
+    expect(markup).toContain('data-recognition-health');
+    expect(markup).toContain('data-diag-recognition-label');
+    expect(markup).toContain('data-diag-recognition-instruction');
+    for (const selector of ['data-diag-raw', 'data-diag-accepted', 'data-diag-assigned', 'data-diag-locked']) {
+      expect(markup).toContain(selector);
+    }
+
+    expect(markup).toContain('data-performance-health');
+    expect(markup).toContain('data-diag-performance-label');
+    expect(markup).toContain('data-diag-performance-instruction');
+    for (const selector of [
+      'data-diag-profile',
+      'data-diag-model',
+      'data-diag-input',
+      'data-diag-throughput',
+      'data-diag-latency',
+      'data-diag-renderer',
+    ]) {
+      expect(markup).toContain(selector);
+    }
+
+    expect(markup).toContain('左右兩側會各自獨立累積校正樣本');
+    expect(markup).toContain('原子封存');
+    expect(markup).not.toContain('同步');
+  });
+});
+
+describe('performance settings screen', () => {
+  it('renders every preset and all advanced device-local controls', () => {
+    const home = homeScreen({
+      cameraReady: false,
+      modelReady: true,
+      demoMode: false,
+      savedEvent: null,
+      devices: [],
+      performanceSettings: {
+        ...getPerformancePresetSettings('quality'),
+        showCameraBehindGame: false,
+      },
+    });
+
+    for (const preset of ['auto', 'performance', 'balanced', 'quality', 'custom']) {
+      expect(home).toContain(`name="performancePreset" value="${preset}"`);
+    }
+    expect(home).toContain('name="performancePreset" value="quality" checked');
+    expect(home).toContain('name="modelPreference"');
+    expect(home).toContain('name="inferenceMaxDimension"');
+    expect(home).toContain('name="inferenceTargetFps"');
+    expect(home).toContain('name="maximumPoseCandidates"');
+    expect(home).toContain('name="gameRenderFps"');
+    expect(home).toContain('name="antialias" checked');
+    expect(home).toContain('name="showCameraBehindGame"');
+    expect(home).not.toContain('name="showCameraBehindGame" checked');
+    expect(home).toContain('name="effectsQuality"');
+    expect(home).toContain('name="poseOverlayRate"');
+    expect(home).toContain('name="cssBlur" checked');
+    expect(home).toContain('id="restore-auto-settings"');
   });
 });
 

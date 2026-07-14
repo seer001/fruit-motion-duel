@@ -1,3 +1,4 @@
+/** Legacy quality target retained for recorded fixtures; runtime uses preset policy. */
 export const CALIBRATION_PERFORMANCE_TARGETS = {
   minimumFps: 20,
   maximumInferenceP95Ms: 45,
@@ -25,6 +26,7 @@ export type CalibrationHealthCode =
   | 'ready';
 
 export interface CalibrationHealthInput {
+  frameReceived?: boolean;
   expectedPlayers: number;
   rawPoseCount: number;
   acceptedCandidateCount: number;
@@ -34,6 +36,8 @@ export interface CalibrationHealthInput {
   calibrationStalled: boolean;
   performance: CalibrationPerformanceSnapshot;
 }
+
+export type CalibrationRecognitionInput = Omit<CalibrationHealthInput, 'performance'>;
 
 export interface CalibrationHealthAssessment {
   code: CalibrationHealthCode;
@@ -58,6 +62,7 @@ export function summarizeCalibrationPerformance(input: {
   inferenceTimestamps: readonly number[];
   nowMs: number;
   backend?: 'gpu' | 'cpu';
+  minimumUsableFps?: number;
 }): CalibrationPerformanceSnapshot {
   const recentTimestamps = input.inferenceTimestamps.filter(
     (timestamp) => timestamp >= input.nowMs - 3_000 && timestamp <= input.nowMs,
@@ -83,7 +88,7 @@ export function summarizeCalibrationPerformance(input: {
   const recentPipelineSamples = input.pipelineSamples.slice(-recentTimestamps.length);
   const clearlyBelowTarget =
     intervalWindow.length >= 2 &&
-    meanInterval > 1_000 / CALIBRATION_PERFORMANCE_TARGETS.minimumFps;
+    meanInterval > 1_000 / (input.minimumUsableFps ?? CALIBRATION_PERFORMANCE_TARGETS.minimumFps);
 
   return {
     fps: meanInterval > 0 ? Math.min(99, 1_000 / meanInterval) : 0,
@@ -97,28 +102,17 @@ export function summarizeCalibrationPerformance(input: {
   };
 }
 
-export function assessCalibrationHealth(
-  input: CalibrationHealthInput,
+/** Recognition/calibration blockers are intentionally independent of timing. */
+export function assessCalibrationRecognition(
+  input: CalibrationRecognitionInput,
 ): CalibrationHealthAssessment {
-  if (!input.performance.ready) {
+  if (input.frameReceived === false) {
     return {
       code: 'measuring',
       label: `正在量測${input.expectedPlayers === 1 ? '單人' : '雙人'}辨識…`,
       instruction: input.expectedPlayers === 1
         ? '請留在畫面中央，穩定站立約 1 秒。'
         : '請兩人留在左右色區，穩定站立約 1 秒。',
-    };
-  }
-
-  const performanceFailed =
-    input.performance.fps < CALIBRATION_PERFORMANCE_TARGETS.minimumFps ||
-    input.performance.inferenceP95Ms > CALIBRATION_PERFORMANCE_TARGETS.maximumInferenceP95Ms ||
-    input.performance.pipelineP95Ms > CALIBRATION_PERFORMANCE_TARGETS.maximumPipelineP95Ms;
-  if (performanceFailed) {
-    return {
-      code: 'performance-insufficient',
-      label: '效能不足',
-      instruction: '先關閉其他視訊程式與高負載分頁，並將鏡頭設為 720p30。',
     };
   }
 
@@ -137,7 +131,7 @@ export function assessCalibrationHealth(
         : '人體已偵測，但候選品質未通過',
       instruction: input.rawPoseCount < input.expectedPlayers
         ? '請拉開距離，讓兩人的頭、雙肩與手肘都完整入鏡。'
-        : '模型看到了兩人，但上半身可靠點不足；請面對鏡頭並露出雙肩、手肘。',
+        : '模型看到了人體，但上半身可靠點不足；請面對鏡頭並露出頭部、雙肩與手肘。',
     };
   }
 
@@ -148,7 +142,7 @@ export function assessCalibrationHealth(
     return {
       code: 'pairing-not-locked',
       label: '玩家配對尚未鎖定',
-      instruction: '請暫時不要交叉或重疊，各自留在左右色區約 1 秒。',
+      instruction: '請各自留在左右色區；兩側可分開累積，完成後才會一次封存身份。',
     };
   }
 
@@ -163,8 +157,8 @@ export function assessCalibrationHealth(
   if (input.calibrationStalled) {
     return {
       code: 'calibration-threshold',
-      label: '玩家已鎖定，但校正品質未通過',
-      instruction: '請正面站立、暫停快速移動，讓雙肩與軀幹連續清楚約 1 秒。',
+      label: '校正品質尚未通過',
+      instruction: '請正面站立並暫停快速移動；耳距不足時會改以穩定頭肩與軀幹比例完成。',
     };
   }
 
@@ -173,4 +167,35 @@ export function assessCalibrationHealth(
     label: input.expectedPlayers === 2 ? '雙人辨識正常' : '單人辨識正常',
     instruction: '身體、玩家身分與主手皆已穩定鎖定。',
   };
+}
+
+export function assessCalibrationHealth(
+  input: CalibrationHealthInput,
+): CalibrationHealthAssessment {
+  if (!input.performance.ready) {
+    return {
+      code: 'measuring',
+      label: `正在量測${input.expectedPlayers === 1 ? '單人' : '雙人'}辨識…`,
+      instruction: input.expectedPlayers === 1
+        ? '請留在畫面中央，穩定站立約 1 秒。'
+        : '請兩人留在左右色區，穩定站立約 1 秒。',
+    };
+  }
+
+  const recognition = assessCalibrationRecognition(input);
+  if (recognition.code !== 'ready') return recognition;
+
+  const performanceFailed =
+    input.performance.fps < CALIBRATION_PERFORMANCE_TARGETS.minimumFps ||
+    input.performance.inferenceP95Ms > CALIBRATION_PERFORMANCE_TARGETS.maximumInferenceP95Ms ||
+    input.performance.pipelineP95Ms > CALIBRATION_PERFORMANCE_TARGETS.maximumPipelineP95Ms;
+  if (performanceFailed) {
+    return {
+      code: 'performance-insufficient',
+      label: '效能不足',
+      instruction: '先關閉其他視訊程式與高負載分頁，並將鏡頭設為 720p30。',
+    };
+  }
+
+  return recognition;
 }

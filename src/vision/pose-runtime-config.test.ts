@@ -35,5 +35,43 @@ describe('selectPoseRuntimeConfig', () => {
       maxPoses: 2,
     });
   });
-});
 
+  it('honours an explicit Lite preference even when a GPU is available', () => {
+    expect(selectPoseRuntimeConfig({ ...request, modelPreference: 'lite' }, 'GPU')).toEqual({
+      modelAssetPath: '/pose-lite.task',
+      modelTier: 'lite',
+      maxPoses: 3,
+    });
+  });
+
+  it('uses explicit Full on GPU and still falls back to Lite on CPU', () => {
+    const qualityRequest: InitializeVisionRequest = {
+      ...request,
+      modelPreference: 'full',
+      maxPoses: 3,
+      cpuMaxPoses: 3,
+    };
+    expect(selectPoseRuntimeConfig(qualityRequest, 'GPU')).toMatchObject({
+      modelAssetPath: '/pose-full.task',
+      modelTier: 'full',
+      maxPoses: 3,
+    });
+    expect(selectPoseRuntimeConfig(qualityRequest, 'CPU')).toMatchObject({
+      modelAssetPath: '/pose-lite.task',
+      modelTier: 'lite',
+      maxPoses: 3,
+    });
+  });
+
+  it('falls back to Lite when a requested GPU model asset is unavailable', () => {
+    const { gpuModelPath: _omitted, ...withoutGpuModel } = request;
+    expect(selectPoseRuntimeConfig({
+      ...withoutGpuModel,
+      modelPreference: 'full',
+    }, 'GPU')).toEqual({
+      modelAssetPath: '/pose-lite.task',
+      modelTier: 'lite',
+      maxPoses: 3,
+    });
+  });
+});

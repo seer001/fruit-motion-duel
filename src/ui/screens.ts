@@ -1,5 +1,10 @@
 import type { Difficulty, Lane, Participant, ScoreBreakdown, TournamentEvent } from '../types/game';
 import type { LeaderboardEntry } from '../tournament';
+import {
+  getPerformancePresetSettings,
+  type PerformanceSettings,
+  type PerformancePreset,
+} from '../config/performance';
 import { describeCameraDevices } from '../vision/camera-devices';
 import { escapeHtml } from './dom';
 
@@ -22,9 +27,97 @@ export interface HomeScreenOptions {
   activeDeviceId?: string;
   savedEvent: TournamentEvent | null;
   devices: MediaDeviceInfo[];
+  performanceSettings?: PerformanceSettings;
+}
+
+const selected = (active: boolean): string => active ? ' selected' : '';
+const checked = (active: boolean): string => active ? ' checked' : '';
+
+function performanceSettingsPanel(settings: PerformanceSettings): string {
+  const presets: Array<{ value: PerformancePreset; label: string; detail: string }> = [
+    { value: 'auto', label: '自動', detail: '從平衡開始並依負載調整' },
+    { value: 'performance', label: '效能優先', detail: '15 FPS · Lite · 30 FPS renderer' },
+    { value: 'balanced', label: '平衡', detail: '20 FPS · 自動模型 · 45 FPS renderer' },
+    { value: 'quality', label: '畫質優先', detail: '30 FPS · Full · 60 FPS renderer' },
+    { value: 'custom', label: '進階自訂', detail: '逐項控制本機負載' },
+  ];
+  return `
+    <form class="performance-settings" id="performance-settings-form">
+      <div class="performance-settings-heading">
+        <div>
+          <p class="eyebrow">DEVICE PERFORMANCE</p>
+          <h2>效能與畫質</h2>
+          <p>設定只保存在這台裝置，不寫入賽事與分數。模型、透明及抗鋸齒只會在沒有進行中回合時套用。</p>
+        </div>
+        <span class="chip" data-performance-apply-status>目前：${settings.preset === 'custom' ? '進階自訂' : settings.preset.toUpperCase()}</span>
+      </div>
+      <div class="performance-preset-grid" role="radiogroup" aria-label="效能預設">
+        ${presets.map(({ value, label, detail }) => `
+          <label>
+            <input type="radio" name="performancePreset" value="${value}"${checked(settings.preset === value)} />
+            <span><strong>${label}</strong><small>${detail}</small></span>
+          </label>
+        `).join('')}
+      </div>
+      <details class="performance-advanced"${settings.preset === 'custom' ? ' open' : ''}>
+        <summary>進階單項設定</summary>
+        <div class="performance-control-grid">
+          <label>姿態模型
+            <select name="modelPreference">
+              <option value="auto"${selected(settings.modelPreference === 'auto')}>自動（GPU Full／CPU Lite）</option>
+              <option value="lite"${selected(settings.modelPreference === 'lite')}>Lite</option>
+              <option value="full"${selected(settings.modelPreference === 'full')}>Full（CPU 後援仍為 Lite）</option>
+            </select>
+          </label>
+          <label>推論最長邊
+            <select name="inferenceMaxDimension">
+              ${[512, 640, 768, 960].map((value) => `<option value="${value}"${selected(settings.inferenceMaxDimension === value)}>${value}px</option>`).join('')}
+            </select>
+          </label>
+          <label>推論目標
+            <select name="inferenceTargetFps">
+              ${[15, 20, 24, 30].map((value) => `<option value="${value}"${selected(settings.inferenceTargetFps === value)}>${value} FPS</option>`).join('')}
+            </select>
+          </label>
+          <label>姿態候選上限
+            <select name="maximumPoseCandidates">
+              <option value="2"${selected(settings.maximumPoseCandidates === 2)}>2</option>
+              <option value="3"${selected(settings.maximumPoseCandidates === 3)}>3</option>
+            </select>
+          </label>
+          <label>遊戲 renderer
+            <select name="gameRenderFps">
+              ${[30, 45, 60].map((value) => `<option value="${value}"${selected(settings.gameRenderFps === value)}>${value} FPS</option>`).join('')}
+            </select>
+          </label>
+          <label>視覺效果
+            <select name="effectsQuality">
+              ${(['off', 'low', 'medium', 'high'] as const).map((value) => `<option value="${value}"${selected(settings.effectsQuality === value)}>${value.toUpperCase()}</option>`).join('')}
+            </select>
+          </label>
+          <label>骨架更新
+            <select name="poseOverlayRate">
+              ${[0, 10, 15, 30].map((value) => `<option value="${value}"${selected(settings.poseOverlayRate === value)}>${value === 0 ? '關閉' : `${value} FPS`}</option>`).join('')}
+            </select>
+          </label>
+        </div>
+        <div class="performance-switch-grid">
+          <label><input type="checkbox" name="spectatorReserve"${checked(settings.spectatorReserve)} /> 保留第三位觀眾候選</label>
+          <label><input type="checkbox" name="antialias"${checked(settings.antialias)} /> Phaser 抗鋸齒</label>
+          <label><input type="checkbox" name="showCameraBehindGame"${checked(settings.showCameraBehindGame)} /> 遊戲後方顯示攝影機</label>
+          <label><input type="checkbox" name="cssBlur"${checked(settings.cssBlur)} /> 介面模糊與合成效果</label>
+        </div>
+      </details>
+      <div class="button-row performance-actions">
+        <button class="btn btn-primary" type="submit" id="apply-performance-settings">套用效能設定</button>
+        <button class="btn btn-ghost" type="button" id="restore-auto-settings">恢復自動設定</button>
+      </div>
+    </form>
+  `;
 }
 
 export function homeScreen(options: HomeScreenOptions): string {
+  const performanceSettings = options.performanceSettings ?? getPerformancePresetSettings('auto');
   const deviceChoices = describeCameraDevices(options.devices);
   const deviceOptions = deviceChoices
     .map(
@@ -75,6 +168,8 @@ export function homeScreen(options: HomeScreenOptions): string {
         </details>
       </div>
     </div>
+
+    ${performanceSettingsPanel(performanceSettings)}
 
     <div class="mode-grid" style="margin-top: 28px">
       <article class="mode-card" data-mode="solo-practice">
@@ -272,6 +367,10 @@ export function calibrationScreen(
   players: readonly CalibrationPlayerView[],
   options: { halfLabel: string; demoMode: boolean },
 ): string {
+  const sampleTarget = 16;
+  const calibrationFlowCopy = players.length === 1
+    ? '系統會獨立累積這位玩家的校正樣本，完成後封存身份設定。'
+    : '左右兩側會各自獨立累積校正樣本；一側先完成後會固定該側結果，另一側可繼續收集。只有兩側都完成後，才會一次原子封存兩份身份設定。';
   const playerCard = ({ participant, lane, progress }: CalibrationPlayerView): string => `
     <article class="calibration-player" data-lane="${lane}" data-player-id="${escapeHtml(participant.id)}">
       <p class="eyebrow">${lane.toUpperCase()} LANE</p>
@@ -281,17 +380,21 @@ export function calibrationScreen(
         ${progress >= 1 ? '✓ 校正完成' : `${Math.round(progress * 100)}% 偵測中`}
       </div>
       <dl class="calibration-player-diagnostics" aria-label="${escapeHtml(participant.displayName)} 辨識品質">
-        <div><dt>追蹤</dt><dd data-player-tracking>等待分配</dd></div>
+        <div><dt>巷道候選</dt><dd data-player-lane-candidates>0 / 0</dd></div>
+        <div><dt>校正樣本</dt><dd data-player-samples>${Math.round(Math.min(1, Math.max(0, progress)) * sampleTarget)}/${sampleTarget}</dd></div>
+        <div><dt>耳距樣本</dt><dd data-player-ears>0/6</dd></div>
+        <div><dt>結構備援</dt><dd data-player-fallback>等待樣本</dd></div>
+        <div><dt>身份</dt><dd data-player-identity data-player-tracking>等待分配</dd></div>
+        <div><dt>主手信心</dt><dd data-player-hand>0% 未就緒</dd></div>
         <div><dt>身體品質</dt><dd data-player-quality>—</dd></div>
         <div><dt>可靠點</dt><dd data-player-reliable>0/17</dd></div>
-        <div><dt>主手信心</dt><dd data-player-hand>0% 未就緒</dd></div>
       </dl>
     </article>`;
 
   return `
     <p class="eyebrow">PLAYER CALIBRATION · ${escapeHtml(options.halfLabel)}</p>
     <h2>${players.length === 1 ? '站在鏡頭中央' : '站進自己的顏色區域'}</h2>
-    <p class="lead">正面朝向鏡頭並保持頭部與雙肩清楚入鏡；系統會同步收集兩位玩家的頭部錨點，完成後以固定色圓環封存身份。接著讓主手自然垂下，再緩慢舉至肩高。大型手部圓環以拇指／食指／小指末端群集定位；肩膀上下約一個軀幹長即可涵蓋遊戲上下緣，不必把手伸出鏡頭。</p>
+    <p class="lead">正面朝向鏡頭並保持頭部與雙肩清楚入鏡。${calibrationFlowCopy}接著讓主手自然垂下，再緩慢舉至肩高。大型手部圓環以拇指／食指／小指末端群集定位；肩膀上下約一個軀幹長即可涵蓋遊戲上下緣，不必把手伸出鏡頭。</p>
     <div class="status-cluster" style="justify-content: center">
       <span class="chip">◎ 大圓環＝可切擊的手指末端群集</span>
       <span class="chip">🔒 頭部色環＝已封存的玩家身份</span>
@@ -299,18 +402,32 @@ export function calibrationScreen(
       <span class="chip">👥 其他入鏡者會被辨識為觀眾並忽略</span>
     </div>
     <section class="calibration-diagnostics" data-calibration-diagnostics data-health="measuring" aria-live="polite">
-      <div class="calibration-health">
-        <strong data-diag-health-label>正在量測${players.length === 1 ? '單人' : '雙人'}辨識…</strong>
-        <span data-diag-health-instruction>${players.length === 1 ? '請留在畫面中央' : '請兩人留在左右色區'}，穩定站立約 1 秒。</span>
-      </div>
-      <dl class="calibration-metrics" aria-label="即時辨識診斷">
-        <div><dt>原始人體</dt><dd data-diag-raw>0</dd></div>
-        <div><dt>合格候選</dt><dd data-diag-accepted>0/${players.length}</dd></div>
-        <div><dt>已分配</dt><dd data-diag-assigned>0/${players.length}</dd></div>
-        <div><dt>身份封存</dt><dd data-diag-locked>0/${players.length}</dd></div>
-        <div><dt>推論吞吐</dt><dd data-diag-throughput>STARTING · 0.0 FPS</dd></div>
-        <div><dt>p95 延遲</dt><dd data-diag-latency>推論 0 / 全流程 0 ms</dd></div>
-      </dl>
+      <article class="calibration-diagnostic-card calibration-recognition-card" data-recognition-health data-health="measuring">
+        <div class="calibration-health">
+          <strong data-diag-recognition-label data-diag-health-label>正在量測${players.length === 1 ? '單人' : '雙人'}辨識…</strong>
+          <span data-diag-recognition-instruction data-diag-health-instruction>${players.length === 1 ? '請留在畫面中央' : '左右玩家可分別累積；請各自留在自己的色區'}，穩定站立約 1 秒。</span>
+        </div>
+        <dl class="calibration-metrics" aria-label="即時辨識診斷">
+          <div><dt>原始人體</dt><dd data-diag-raw>0</dd></div>
+          <div><dt>合格候選</dt><dd data-diag-accepted>0/${players.length}</dd></div>
+          <div><dt>已分配</dt><dd data-diag-assigned>0/${players.length}</dd></div>
+          <div><dt>身份封存</dt><dd data-diag-locked>0/${players.length}</dd></div>
+        </dl>
+      </article>
+      <article class="calibration-diagnostic-card calibration-performance-card" data-performance-health data-health="measuring">
+        <div class="calibration-health">
+          <strong data-diag-performance-label>正在量測效能…</strong>
+          <span data-diag-performance-instruction>效能狀態獨立顯示，不會覆蓋玩家辨識與校正原因。</span>
+        </div>
+        <dl class="calibration-metrics" aria-label="即時效能診斷">
+          <div><dt>效能設定</dt><dd data-diag-profile>正在讀取</dd></div>
+          <div><dt>姿態模型</dt><dd data-diag-model>STARTING</dd></div>
+          <div><dt>推論輸入</dt><dd data-diag-input>—</dd></div>
+          <div><dt>推論吞吐</dt><dd data-diag-throughput>STARTING · 0.0 FPS</dd></div>
+          <div><dt>p95 延遲</dt><dd data-diag-latency>推論 0 / 全流程 0 ms</dd></div>
+          <div><dt>Renderer</dt><dd data-diag-renderer>等待啟用</dd></div>
+        </dl>
+      </article>
     </section>
     <div class="calibration-layout${players.length === 1 ? ' is-single' : ''}" style="margin-top: 24px">
       ${players.map((view, index) => `${index > 0 ? '<div class="safe-divider">中央安全區</div>' : ''}${playerCard(view)}`).join('')}

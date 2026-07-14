@@ -2,6 +2,7 @@ export * from './adaptive-calibration';
 export * from './camera';
 export * from './camera-devices';
 export * from './calibration-diagnostics';
+export * from './inference-scheduler';
 export * from './landmarks';
 export * from './tracker';
 export * from './tracking-safety';

@@ -7,7 +7,14 @@ import type {
   VisionWorkerOutbound,
 } from '../types/game';
 import {
+  getPerformancePresetSettings,
+  normalizePerformanceSettings,
+  type PerformanceSettings,
+} from '../config/performance';
+import {
   AdaptiveVisionLoadController,
+  visionProfileForPerformanceSettings,
+  type AutoVisionRuntimePolicy,
   type VisionAdaptiveProfile,
   type VisionDiagnosis,
 } from './vision-adaptation';
@@ -32,6 +39,18 @@ interface PendingCapture {
   generation: number;
 }
 
+interface ConfigurationWaiter {
+  target: 2 | 3;
+  resolve(): void;
+  reject(error: Error): void;
+}
+
+interface InFlightRuntimeSettings {
+  maximumInputDimension: PerformanceSettings['inferenceMaxDimension'];
+  targetFps: PerformanceSettings['inferenceTargetFps'];
+  adaptiveMode: VisionAdaptiveProfile['mode'];
+}
+
 export interface VisionClientOptions {
   wasmRoot?: string;
   modelPath?: string;
@@ -41,7 +60,13 @@ export interface VisionClientOptions {
   workerFactory?: () => VisionWorkerPort;
   createBitmap?: (source: VisionFrameSource) => Promise<ImageBitmap>;
   /** Fixed longest bitmap edge. Omit to allow the adaptive 512–960 px policy. */
-  inferenceMaxDimension?: number;
+  inferenceMaxDimension?: PerformanceSettings['inferenceMaxDimension'];
+  performanceSettings?: PerformanceSettings;
+}
+
+interface PendingSettingsApply {
+  key: string;
+  promise: Promise<void>;
 }
 
 interface SourceDimensions {
@@ -137,8 +162,10 @@ export class VisionClient {
   private readonly createBitmapOverride:
     | ((source: VisionFrameSource) => Promise<ImageBitmap>)
     | undefined;
-  private readonly inferenceMaxDimensionOverride: number | undefined;
-  private readonly adaptation = new AdaptiveVisionLoadController('cpu');
+  private readonly inferenceMaxDimensionOverride:
+    | PerformanceSettings['inferenceMaxDimension']
+    | undefined;
+  private readonly adaptation: AdaptiveVisionLoadController;
   private readonly poseListeners = new Set<(frame: PoseFrame) => void>();
   private readonly errorListeners = new Set<(error: VisionErrorMessage) => void>();
   private currentState: VisionClientState = 'idle';
@@ -151,17 +178,29 @@ export class VisionClient {
   private pendingCapture: PendingCapture | null = null;
   private captureInProgress = false;
   private inferenceInFlight = false;
+  private inFlightRuntimeSettings: InFlightRuntimeSettings | null = null;
   private configurationInFlight = false;
+  private configurationWaiters: ConfigurationWaiter[] = [];
   private activeBackend: PoseBackend = 'cpu';
-  private activeProfile: VisionAdaptiveProfile = this.adaptation.profile;
+  private activeProfile: VisionAdaptiveProfile;
   private activeWorkerMaxPoses: 2 | 3 = 2;
+  private activeWorkerModelTier: 'lite' | 'full' = 'lite';
+  private performanceSettings: PerformanceSettings;
+  private committedPerformanceSettings: PerformanceSettings;
+  private expectedPoseCount: 1 | 2 | null = null;
   private reportedTrackedPoseCount: number | null = null;
+  private calibrationStalled = false;
+  private reportedCandidatePressure = false;
   private latestDiagnosis: VisionDiagnosis = 'warming-up';
   private lastDeliveredPoseAt: number | null = null;
   private forceCpu = false;
   private nextFrameId = 1;
   private minimumAcceptedFrameId = 1;
   private generation = 0;
+  private settingsApplyVersion = 0;
+  private autoRuntimePolicy: AutoVisionRuntimePolicy;
+  private committedAutoRuntimePolicy: AutoVisionRuntimePolicy;
+  private pendingSettingsApply: PendingSettingsApply | null = null;
 
   constructor(options: VisionClientOptions = {}) {
     this.wasmRoot = options.wasmRoot ?? publicAssetUrl('vendor/mediapipe');
@@ -170,8 +209,7 @@ export class VisionClient {
     // camera frame without paying that cost on CPU fallback machines.
     this.modelPath = options.modelPath ?? publicAssetUrl('models/pose_landmarker_lite.task');
     this.gpuModelPath =
-      options.gpuModelPath ??
-      (options.modelPath ?? publicAssetUrl('models/pose_landmarker_full.task'));
+      options.gpuModelPath ?? publicAssetUrl('models/pose_landmarker_full.task');
     this.initializationTimeoutMs = options.initializationTimeoutMs ?? 20_000;
     this.frameTimeoutMs = options.frameTimeoutMs ?? 1_500;
     if (!Number.isFinite(this.frameTimeoutMs) || this.frameTimeoutMs <= 0) {
@@ -180,11 +218,22 @@ export class VisionClient {
     const inferenceMaxDimension = options.inferenceMaxDimension;
     if (
       inferenceMaxDimension !== undefined &&
-      (!Number.isFinite(inferenceMaxDimension) || inferenceMaxDimension <= 0)
+      !([512, 640, 768, 960] as const).includes(inferenceMaxDimension)
     ) {
-      throw new RangeError('inferenceMaxDimension must be positive and finite');
+      throw new RangeError('inferenceMaxDimension must be 512, 640, 768, or 960');
     }
     this.inferenceMaxDimensionOverride = inferenceMaxDimension;
+    this.performanceSettings = normalizePerformanceSettings(
+      options.performanceSettings ?? getPerformancePresetSettings('auto'),
+    );
+    this.committedPerformanceSettings = this.performanceSettings;
+    this.adaptation = new AdaptiveVisionLoadController('cpu', this.performanceSettings);
+    this.activeProfile = this.adaptation.profile;
+    this.autoRuntimePolicy = {
+      targetFps: this.performanceSettings.inferenceTargetFps,
+      visionLoadReductionAllowed: true,
+    };
+    this.committedAutoRuntimePolicy = this.autoRuntimePolicy;
     this.createBitmapOverride = options.createBitmap;
     this.workerFactory = options.workerFactory ?? defaultWorkerFactory;
     this.worker = this.workerFactory();
@@ -195,21 +244,155 @@ export class VisionClient {
     return this.currentState;
   }
 
+  get settings(): PerformanceSettings {
+    return { ...this.committedPerformanceSettings };
+  }
+
+  get inferenceTargetFps(): PerformanceSettings['inferenceTargetFps'] {
+    return this.adaptation.targetFps;
+  }
+
+  setAutoRuntimePolicy(policy: AutoVisionRuntimePolicy): void {
+    if (this.performanceSettings.preset !== 'auto') return;
+    const nextProfile = this.adaptation.setAutoRuntimePolicy(policy);
+    this.autoRuntimePolicy = { ...policy };
+    this.committedAutoRuntimePolicy = this.autoRuntimePolicy;
+    this.activeProfile = nextProfile;
+    this.latestDiagnosis = 'warming-up';
+    this.lastDeliveredPoseAt = null;
+    if (
+      this.currentState === 'ready' &&
+      this.activeWorkerMaxPoses !== this.activeProfile.maxPoses
+    ) {
+      this.requestWorkerConfiguration(this.activeProfile.maxPoses);
+    }
+  }
+
+  /**
+   * Applies device-local vision settings. The caller owns the game-state gate;
+   * this method makes a permitted non-round change atomic from VisionClient's
+   * perspective and rebuilds the Worker whenever model intent changes.
+   */
+  applyPerformanceSettings(input: PerformanceSettings): Promise<void> {
+    if (this.currentState === 'closed') {
+      return Promise.reject(new Error('VisionClient is closed'));
+    }
+    const next = normalizePerformanceSettings(input);
+    const key = JSON.stringify(next);
+    if (this.pendingSettingsApply?.key === key) return this.pendingSettingsApply.promise;
+    if (
+      this.pendingSettingsApply === null &&
+      JSON.stringify(this.committedPerformanceSettings) === key
+    ) {
+      return Promise.resolve();
+    }
+
+    const applyVersion = ++this.settingsApplyVersion;
+    const applying = this.performSettingsApply(next, applyVersion);
+    const pending: PendingSettingsApply = { key, promise: applying };
+    this.pendingSettingsApply = pending;
+    void applying.then(
+      () => {
+        if (this.pendingSettingsApply === pending) this.pendingSettingsApply = null;
+      },
+      () => {
+        if (this.pendingSettingsApply === pending) this.pendingSettingsApply = null;
+      },
+    );
+    return applying;
+  }
+
+  private async performSettingsApply(
+    next: PerformanceSettings,
+    applyVersion: number,
+  ): Promise<void> {
+    const previous = this.committedPerformanceSettings;
+    const previousRuntimePolicy = { ...this.committedAutoRuntimePolicy };
+    const modelChanged = this.performanceSettings.modelPreference !== next.modelPreference;
+    this.rejectConfigurationWaiters(new Error('Vision settings were superseded'));
+    this.performanceSettings = next;
+    this.activeProfile = this.adaptation.setPerformanceSettings(next);
+    this.autoRuntimePolicy = {
+      targetFps: next.inferenceTargetFps,
+      visionLoadReductionAllowed: true,
+    };
+    this.latestDiagnosis = 'warming-up';
+    this.lastDeliveredPoseAt = null;
+    this.reportedTrackedPoseCount = null;
+    this.calibrationStalled = false;
+    this.reportedCandidatePressure = false;
+
+    try {
+      if (this.currentState === 'idle') {
+        // No Worker state has been applied yet; the next initialize request is
+        // the atomic commit point.
+      } else if (
+        modelChanged ||
+        this.currentState === 'initializing' ||
+        this.currentState === 'error'
+      ) {
+        await this.restartWorker(false);
+      } else {
+        // Ignore any result captured under the prior dimension/profile. A frame
+        // already owned by the Worker is allowed to finish but is never delivered.
+        this.generation += 1;
+        this.pendingCapture = null;
+        this.minimumAcceptedFrameId = this.nextFrameId;
+        if (
+          this.configurationInFlight ||
+          this.activeWorkerMaxPoses !== this.activeProfile.maxPoses
+        ) {
+          await this.waitForWorkerConfiguration(this.activeProfile.maxPoses);
+        }
+      }
+      if (applyVersion !== this.settingsApplyVersion) {
+        throw new Error('Vision settings were superseded');
+      }
+      this.committedPerformanceSettings = next;
+      this.committedAutoRuntimePolicy = this.autoRuntimePolicy;
+    } catch (error) {
+      // A newer apply owns the desired state. Only the latest failed operation
+      // may restore its predecessor; otherwise an older rejection could undo a
+      // subsequently acknowledged choice.
+      if (this.state !== 'closed' && applyVersion === this.settingsApplyVersion) {
+        this.performanceSettings = previous;
+        this.committedPerformanceSettings = previous;
+        this.activeProfile = this.adaptation.setPerformanceSettings(previous);
+        this.autoRuntimePolicy = previousRuntimePolicy;
+        this.committedAutoRuntimePolicy = previousRuntimePolicy;
+        this.activeProfile = this.adaptation.setAutoRuntimePolicy(previousRuntimePolicy);
+        this.latestDiagnosis = 'warming-up';
+        this.lastDeliveredPoseAt = null;
+        if (
+          this.currentState === 'ready' &&
+          this.activeWorkerMaxPoses !== this.activeProfile.maxPoses
+        ) {
+          this.requestWorkerConfiguration(this.activeProfile.maxPoses);
+        }
+      }
+      throw error;
+    }
+  }
+
   initialize(): Promise<void> {
     if (this.currentState === 'closed') {
       return Promise.reject(new Error('VisionClient is closed'));
     }
     if (this.currentState === 'ready') return Promise.resolve();
     if (this.initializePromise !== null) return this.initializePromise;
+    if (this.currentState === 'error') return this.restartWorker(this.forceCpu);
 
     this.currentState = 'initializing';
-    this.initializePromise = new Promise<void>((resolve, reject) => {
-      this.resolveInitialize = resolve;
-      this.rejectInitialize = reject;
-    });
+    const initializing = this.ensureInitializationPromise();
     this.armInitializationTimeout();
-    this.worker.postMessage(this.initializeRequest());
-    return this.initializePromise;
+    try {
+      this.worker.postMessage(this.initializeRequest());
+    } catch (error) {
+      this.currentState = 'error';
+      this.rejectInitialize?.(error instanceof Error ? error : new Error(String(error)));
+      this.clearInitializationPromise();
+    }
+    return initializing;
   }
 
   /**
@@ -218,7 +401,10 @@ export class VisionClient {
    * checks do not mistake a lone host for a missing second player.
    */
   setExpectedPoseCount(expected: 1 | 2 | null): void {
+    this.expectedPoseCount = expected;
     this.reportedTrackedPoseCount = null;
+    this.calibrationStalled = false;
+    this.reportedCandidatePressure = false;
     this.lastDeliveredPoseAt = null;
     this.activeProfile = this.adaptation.setExpectedPoseCount(expected);
     this.latestDiagnosis = 'warming-up';
@@ -239,6 +425,12 @@ export class VisionClient {
       throw new RangeError('Tracked pose count must be an integer from 0 to 2');
     }
     this.reportedTrackedPoseCount = count;
+  }
+
+  /** Supplies calibration-only feedback for the next adaptive sample. */
+  reportCalibrationStall(stalled: boolean, candidatePressure = false): void {
+    this.calibrationStalled = stalled;
+    this.reportedCandidatePressure = candidatePressure;
   }
 
   submitFrame(source: VisionFrameSource, timestampMs: number): void {
@@ -277,6 +469,7 @@ export class VisionClient {
     this.clearInitializationPromise();
     this.clearFrameTimer();
     this.clearConfigurationTimer();
+    this.rejectConfigurationWaiters(new Error('VisionClient closed'));
     this.poseListeners.clear();
     this.errorListeners.clear();
     this.worker.terminate();
@@ -303,6 +496,7 @@ export class VisionClient {
         const capturedAtMs = performance.now();
         if (this.currentState !== 'ready' || capture.generation !== this.generation) {
           bitmap.close();
+          this.pump();
           return;
         }
 
@@ -316,10 +510,16 @@ export class VisionClient {
         };
         try {
           this.inferenceInFlight = true;
+          this.inFlightRuntimeSettings = {
+            maximumInputDimension: this.maximumInputDimension(),
+            targetFps: this.adaptation.targetFps,
+            adaptiveMode: this.activeProfile.mode,
+          };
           this.worker.postMessage(request, [bitmap]);
           this.armFrameTimeout(request.frameId);
         } catch (error) {
           this.inferenceInFlight = false;
+          this.inFlightRuntimeSettings = null;
           bitmap.close();
           this.emitError({
             type: 'error',
@@ -347,6 +547,7 @@ export class VisionClient {
         this.clearFrameTimer();
         this.activeBackend = message.backend ?? 'cpu';
         this.activeProfile = this.adaptation.setBackend(this.activeBackend);
+        this.activeWorkerModelTier = message.modelTier ?? this.activeProfile.modelTier;
         this.latestDiagnosis = 'warming-up';
         this.lastDeliveredPoseAt = null;
         this.activeWorkerMaxPoses = message.maxPoses ?? this.activeProfile.maxPoses;
@@ -355,6 +556,8 @@ export class VisionClient {
         this.clearInitializationPromise();
         if (this.activeWorkerMaxPoses !== this.activeProfile.maxPoses) {
           this.requestWorkerConfiguration(this.activeProfile.maxPoses);
+        } else {
+          this.resolveConfigurationWaiters(this.activeWorkerMaxPoses);
         }
         this.pump();
         break;
@@ -362,6 +565,7 @@ export class VisionClient {
         this.clearConfigurationTimer();
         this.configurationInFlight = false;
         this.activeWorkerMaxPoses = message.maxPoses;
+        this.resolveConfigurationWaiters(message.maxPoses);
         this.lastDeliveredPoseAt = null;
         if (this.activeWorkerMaxPoses !== this.activeProfile.maxPoses) {
           this.requestWorkerConfiguration(this.activeProfile.maxPoses);
@@ -371,6 +575,8 @@ export class VisionClient {
       case 'poses':
         this.clearFrameTimer();
         this.inferenceInFlight = false;
+        const frameRuntimeSettings = this.inFlightRuntimeSettings;
+        this.inFlightRuntimeSettings = null;
         if (message.frameId >= this.minimumAcceptedFrameId) {
           const receivedAtMs = performance.now();
           const resultIntervalMs =
@@ -392,14 +598,23 @@ export class VisionClient {
                 },
               };
           if (deliveredMessage.performance !== undefined) {
+            if (deliveredMessage.performance.backend !== this.activeBackend) {
+              this.activeBackend = deliveredMessage.performance.backend;
+              this.activeProfile = this.adaptation.setBackend(this.activeBackend);
+            }
             this.activeWorkerMaxPoses =
               deliveredMessage.performance.maxPoses ?? this.activeWorkerMaxPoses;
+            this.activeWorkerModelTier =
+              deliveredMessage.performance.modelTier ?? this.activeWorkerModelTier;
+            const effectivePoseCount =
+              this.reportedTrackedPoseCount ?? deliveredMessage.poses.length;
             const adaptation = this.adaptation.observe({
               inferenceMs: deliveredMessage.performance.inferenceMs,
               pipelineMs: deliveredMessage.performance.pipelineMs,
-              poseCount:
-                this.reportedTrackedPoseCount ?? deliveredMessage.poses.length,
+              poseCount: effectivePoseCount,
               ...(resultIntervalMs === undefined ? {} : { resultIntervalMs }),
+              calibrationStalled: this.calibrationStalled,
+              candidatePressure: this.reportedCandidatePressure,
             });
             this.latestDiagnosis = adaptation.diagnosis;
             if (adaptation.profileChanged) {
@@ -412,7 +627,15 @@ export class VisionClient {
               ...deliveredMessage,
               performance: {
                 ...deliveredMessage.performance,
-                adaptiveMode: this.activeProfile.mode,
+                backend: this.activeBackend,
+                maxPoses: this.activeWorkerMaxPoses,
+                modelTier: this.activeWorkerModelTier,
+                targetFps:
+                  frameRuntimeSettings?.targetFps ?? this.adaptation.targetFps,
+                maximumInputDimension:
+                  frameRuntimeSettings?.maximumInputDimension ?? this.maximumInputDimension(),
+                adaptiveMode:
+                  frameRuntimeSettings?.adaptiveMode ?? this.activeProfile.mode,
                 diagnosis: this.latestDiagnosis,
               },
             };
@@ -424,8 +647,11 @@ export class VisionClient {
       case 'error':
         this.clearFrameTimer();
         this.clearConfigurationTimer();
+        const configurationFailed = this.configurationInFlight;
         this.inferenceInFlight = false;
+        this.inFlightRuntimeSettings = null;
         this.configurationInFlight = false;
+        this.rejectConfigurationWaiters(new Error(message.message));
         if (message.recoveryAction === 'reinitialize-cpu') {
           this.forceCpu = true;
           this.currentState = 'initializing';
@@ -434,6 +660,11 @@ export class VisionClient {
           this.minimumAcceptedFrameId = this.nextFrameId;
           this.armInitializationTimeout();
           this.emitError(message);
+          break;
+        }
+        if (configurationFailed && message.recoverable) {
+          this.emitError(message);
+          this.restartWorkerOnCpu();
           break;
         }
         if (this.currentState === 'initializing') {
@@ -453,6 +684,7 @@ export class VisionClient {
     this.clearFrameTimer();
     this.clearConfigurationTimer();
     this.inferenceInFlight = false;
+    this.inFlightRuntimeSettings = null;
     this.configurationInFlight = false;
     if (!this.forceCpu) {
       const message = event.message || 'GPU 姿態辨識 Worker 中斷，正在改用 CPU。';
@@ -479,14 +711,26 @@ export class VisionClient {
     this.rejectInitialize = null;
   }
 
+  private ensureInitializationPromise(): Promise<void> {
+    if (this.initializePromise !== null) return this.initializePromise;
+    this.initializePromise = new Promise<void>((resolve, reject) => {
+      this.resolveInitialize = resolve;
+      this.rejectInitialize = reject;
+    });
+    return this.initializePromise;
+  }
+
   private initializeRequest(): InitializeVisionRequest {
+    const gpuProfile = visionProfileForPerformanceSettings(this.performanceSettings, 'gpu');
+    const cpuProfile = visionProfileForPerformanceSettings(this.performanceSettings, 'cpu');
     return {
       type: 'initialize',
       wasmRoot: this.wasmRoot,
       modelPath: this.modelPath,
       gpuModelPath: this.gpuModelPath,
-      maxPoses: 3,
-      cpuMaxPoses: 2,
+      maxPoses: gpuProfile.maxPoses,
+      cpuMaxPoses: cpuProfile.maxPoses,
+      modelPreference: this.performanceSettings.modelPreference,
       ...(this.forceCpu ? { forceBackend: 'cpu' as const } : {}),
     };
   }
@@ -495,9 +739,13 @@ export class VisionClient {
     if (this.createBitmapOverride !== undefined) return this.createBitmapOverride(source);
     return createLowLatencyBitmap(
       source,
-      this.inferenceMaxDimensionOverride ?? this.activeProfile.maxDimension,
+      this.maximumInputDimension(),
       this.activeProfile.resizeQuality,
     );
+  }
+
+  private maximumInputDimension(): PerformanceSettings['inferenceMaxDimension'] {
+    return this.inferenceMaxDimensionOverride ?? this.activeProfile.maxDimension;
   }
 
   private bindWorker(worker: VisionWorkerPort): void {
@@ -509,10 +757,52 @@ export class VisionClient {
     });
   }
 
+  private waitForWorkerConfiguration(target: 2 | 3): Promise<void> {
+    if (
+      this.currentState === 'ready' &&
+      !this.configurationInFlight &&
+      this.activeWorkerMaxPoses === target
+    ) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.configurationWaiters.push({ target, resolve, reject });
+      this.requestWorkerConfiguration(target);
+    });
+  }
+
+  private resolveConfigurationWaiters(maxPoses: 2 | 3): void {
+    const remaining: ConfigurationWaiter[] = [];
+    for (const waiter of this.configurationWaiters) {
+      if (waiter.target === maxPoses) waiter.resolve();
+      else remaining.push(waiter);
+    }
+    this.configurationWaiters = remaining;
+  }
+
+  private rejectConfigurationWaiters(error: Error): void {
+    const waiters = this.configurationWaiters;
+    this.configurationWaiters = [];
+    for (const waiter of waiters) waiter.reject(error);
+  }
+
   private requestWorkerConfiguration(maxPoses: 2 | 3): void {
     if (this.configurationInFlight || this.currentState !== 'ready') return;
     this.configurationInFlight = true;
-    this.worker.postMessage({ type: 'configure', maxPoses });
+    try {
+      this.worker.postMessage({ type: 'configure', maxPoses });
+    } catch (error) {
+      this.configurationInFlight = false;
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.rejectConfigurationWaiters(failure);
+      this.emitError({
+        type: 'error',
+        message: `無法調整姿態推論負載：${failure.message}`,
+        recoverable: true,
+      });
+      this.restartWorkerOnCpu();
+      return;
+    }
     this.clearConfigurationTimer();
     this.configurationTimer = setTimeout(() => {
       if (!this.configurationInFlight || this.currentState !== 'ready') return;
@@ -572,21 +862,46 @@ export class VisionClient {
   }
 
   private restartWorkerOnCpu(): void {
+    void this.restartWorker(true).catch(() => undefined);
+  }
+
+  private restartWorker(forceCpu: boolean): Promise<void> {
+    let nextWorker: VisionWorkerPort;
+    try {
+      nextWorker = this.workerFactory();
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.currentState = 'error';
+      this.rejectInitialize?.(failure);
+      this.clearInitializationPromise();
+      return Promise.reject(failure);
+    }
+    const initializing = this.ensureInitializationPromise();
     this.clearFrameTimer();
     this.clearConfigurationTimer();
+    this.rejectConfigurationWaiters(new Error('Vision Worker restarted'));
     this.worker.terminate();
-    this.forceCpu = true;
+    this.forceCpu = forceCpu;
     this.currentState = 'initializing';
     this.generation += 1;
     this.pendingCapture = null;
-    this.captureInProgress = false;
     this.inferenceInFlight = false;
+    this.inFlightRuntimeSettings = null;
     this.configurationInFlight = false;
     this.lastDeliveredPoseAt = null;
     this.minimumAcceptedFrameId = this.nextFrameId;
-    this.worker = this.workerFactory();
+    this.worker = nextWorker;
     this.bindWorker(this.worker);
     this.armInitializationTimeout();
-    this.worker.postMessage(this.initializeRequest());
+    try {
+      this.worker.postMessage(this.initializeRequest());
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.currentState = 'error';
+      this.worker.terminate();
+      this.rejectInitialize?.(failure);
+      this.clearInitializationPromise();
+    }
+    return initializing;
   }
 }

@@ -149,6 +149,36 @@ textarea:focus-visible {
   object-fit: contain;
 }
 
+#app.is-game-active[data-camera-behind-game="false"] .camera-feed {
+  opacity: 0;
+}
+
+#app.is-game-active[data-camera-behind-game="false"] .video-scrim {
+  background: linear-gradient(160deg, #071522, #020812);
+}
+
+#app[data-css-blur="false"] .status-pill,
+#app[data-css-blur="false"] .chip,
+#app[data-css-blur="false"] .screen,
+#app[data-css-blur="false"] .hud-score,
+#app[data-css-blur="false"] .host-dock,
+#app[data-css-blur="false"] .countdown-overlay,
+#app[data-css-blur="false"] .pause-overlay {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+#app[data-effects-quality="off"] .pose-layer,
+#app[data-effects-quality="low"] .pose-layer {
+  filter: none;
+}
+
+#app[data-effects-quality="off"] .hud-score,
+#app[data-effects-quality="off"] .hud-timer,
+#app[data-effects-quality="low"] .hud-score {
+  box-shadow: none;
+}
+
 .overlay-layer {
   z-index: 4;
   display: grid;
@@ -345,6 +375,127 @@ h3 {
 
 .mode-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.performance-settings {
+  display: grid;
+  gap: 18px;
+  margin-top: 28px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(2, 10, 18, 0.58);
+}
+
+.performance-settings-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.performance-settings-heading h2,
+.performance-settings-heading p:last-child {
+  margin-bottom: 0;
+}
+
+.performance-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.performance-preset-grid label {
+  position: relative;
+  min-width: 0;
+}
+
+.performance-preset-grid input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.performance-preset-grid span {
+  display: grid;
+  align-content: center;
+  min-height: 76px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+}
+
+.performance-preset-grid strong {
+  color: var(--ink);
+}
+
+.performance-preset-grid small {
+  margin-top: 4px;
+  line-height: 1.3;
+}
+
+.performance-preset-grid input:checked + span {
+  border-color: rgba(53, 216, 255, 0.72);
+  background: rgba(53, 216, 255, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(53, 216, 255, 0.22);
+}
+
+.performance-advanced {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.performance-advanced summary {
+  cursor: pointer;
+  font-weight: 850;
+}
+
+.performance-control-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.performance-control-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.performance-switch-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 14px;
+}
+
+.performance-switch-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.performance-switch-grid input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--cyan);
+}
+
+.performance-actions {
+  justify-content: flex-end;
 }
 
 .setup-grid {
@@ -685,9 +836,14 @@ h3 {
 
 .calibration-diagnostics {
   display: grid;
-  grid-template-columns: minmax(250px, 0.9fr) minmax(520px, 2fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
   margin-top: 18px;
+}
+
+.calibration-diagnostic-card {
+  display: grid;
+  gap: 12px;
   padding: 14px;
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 18px;
@@ -716,37 +872,75 @@ h3 {
   line-height: 1.35;
 }
 
-.calibration-diagnostics[data-health="performance-insufficient"] .calibration-health,
-.calibration-diagnostics[data-health="only-one-person"] .calibration-health,
-.calibration-diagnostics[data-health="pairing-not-locked"] .calibration-health,
-.calibration-diagnostics[data-health="dominant-hand-missing"] .calibration-health,
-.calibration-diagnostics[data-health="calibration-threshold"] .calibration-health {
+.calibration-performance-card .calibration-health {
+  border-left-color: var(--cyan);
+  background: rgba(53, 216, 255, 0.09);
+}
+
+.calibration-performance-card .calibration-health strong {
+  color: var(--cyan);
+}
+
+.calibration-diagnostic-card[data-health="performance-insufficient"] .calibration-health,
+.calibration-diagnostic-card[data-health="only-one-person"] .calibration-health,
+.calibration-diagnostic-card[data-health="pairing-not-locked"] .calibration-health,
+.calibration-diagnostic-card[data-health="dominant-hand-missing"] .calibration-health,
+.calibration-diagnostic-card[data-health="calibration-threshold"] .calibration-health,
+.calibration-performance-card[data-health="insufficient"] .calibration-health,
+.calibration-diagnostics[data-health="performance-insufficient"] [data-recognition-health] .calibration-health,
+.calibration-diagnostics[data-health="only-one-person"] [data-recognition-health] .calibration-health,
+.calibration-diagnostics[data-health="pairing-not-locked"] [data-recognition-health] .calibration-health,
+.calibration-diagnostics[data-health="dominant-hand-missing"] [data-recognition-health] .calibration-health,
+.calibration-diagnostics[data-health="calibration-threshold"] [data-recognition-health] .calibration-health {
   border-left-color: #ff655e;
   background: rgba(255, 101, 94, 0.1);
 }
 
-.calibration-diagnostics[data-health="performance-insufficient"] .calibration-health strong,
-.calibration-diagnostics[data-health="only-one-person"] .calibration-health strong,
-.calibration-diagnostics[data-health="pairing-not-locked"] .calibration-health strong,
-.calibration-diagnostics[data-health="dominant-hand-missing"] .calibration-health strong,
-.calibration-diagnostics[data-health="calibration-threshold"] .calibration-health strong {
+.calibration-diagnostic-card[data-health="performance-insufficient"] .calibration-health strong,
+.calibration-diagnostic-card[data-health="only-one-person"] .calibration-health strong,
+.calibration-diagnostic-card[data-health="pairing-not-locked"] .calibration-health strong,
+.calibration-diagnostic-card[data-health="dominant-hand-missing"] .calibration-health strong,
+.calibration-diagnostic-card[data-health="calibration-threshold"] .calibration-health strong,
+.calibration-performance-card[data-health="insufficient"] .calibration-health strong,
+.calibration-diagnostics[data-health="performance-insufficient"] [data-recognition-health] .calibration-health strong,
+.calibration-diagnostics[data-health="only-one-person"] [data-recognition-health] .calibration-health strong,
+.calibration-diagnostics[data-health="pairing-not-locked"] [data-recognition-health] .calibration-health strong,
+.calibration-diagnostics[data-health="dominant-hand-missing"] [data-recognition-health] .calibration-health strong,
+.calibration-diagnostics[data-health="calibration-threshold"] [data-recognition-health] .calibration-health strong {
   color: #ff8f88;
 }
 
-.calibration-diagnostics[data-health="ready"] .calibration-health {
+.calibration-diagnostic-card[data-health="ready"] .calibration-health,
+.calibration-performance-card[data-health="good"] .calibration-health,
+.calibration-diagnostics[data-health="ready"] [data-recognition-health] .calibration-health {
   border-left-color: var(--lime);
   background: rgba(185, 245, 100, 0.1);
 }
 
-.calibration-diagnostics[data-health="ready"] .calibration-health strong {
+.calibration-diagnostic-card[data-health="ready"] .calibration-health strong,
+.calibration-performance-card[data-health="good"] .calibration-health strong,
+.calibration-diagnostics[data-health="ready"] [data-recognition-health] .calibration-health strong {
   color: var(--lime);
+}
+
+.calibration-performance-card[data-health="degraded"] .calibration-health {
+  border-left-color: var(--orange);
+  background: rgba(255, 180, 67, 0.09);
+}
+
+.calibration-performance-card[data-health="degraded"] .calibration-health strong {
+  color: var(--orange);
 }
 
 .calibration-metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
   margin: 0;
+}
+
+.calibration-performance-card .calibration-metrics {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .calibration-metrics div {
@@ -1060,6 +1254,16 @@ h3 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .performance-settings-heading {
+    display: grid;
+  }
+
+  .performance-preset-grid,
+  .performance-control-grid,
+  .performance-switch-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .topbar .brand span:last-child,
   .status-pill span:last-child,
   .volume-control span {
@@ -1079,6 +1283,10 @@ h3 {
   }
 
   .calibration-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .calibration-performance-card .calibration-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

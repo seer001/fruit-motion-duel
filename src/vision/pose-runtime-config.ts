@@ -12,9 +12,10 @@ export function selectPoseRuntimeConfig(
   delegate: 'GPU' | 'CPU',
 ): PoseRuntimeConfig {
   if (delegate === 'GPU' && request.forceBackend !== 'cpu') {
+    const useLite = request.modelPreference === 'lite' || request.gpuModelPath === undefined;
     return {
-      modelAssetPath: request.gpuModelPath ?? request.modelPath,
-      modelTier: request.gpuModelPath === undefined ? 'lite' : 'full',
+      modelAssetPath: useLite ? request.modelPath : request.gpuModelPath!,
+      modelTier: useLite ? 'lite' : 'full',
       maxPoses: request.maxPoses,
     };
   }
@@ -24,4 +25,3 @@ export function selectPoseRuntimeConfig(
     maxPoses: request.cpuMaxPoses ?? 2,
   };
 }
-

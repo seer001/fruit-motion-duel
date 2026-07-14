@@ -1,5 +1,6 @@
 import { escapeHtml, requireElement } from './dom';
 import type { NormalizedLandmark, PoseObservation } from '../types/game';
+import type { PerformanceSettings } from '../config/performance';
 
 export type CameraUiState = 'idle' | 'requesting' | 'ready' | 'warning' | 'error';
 
@@ -49,6 +50,8 @@ export class AppShell {
   private countdownElement: HTMLElement | null = null;
   private pauseElement: HTMLElement | null = null;
   private hudElement: HTMLElement | null = null;
+  private poseOverlayRate: 0 | 10 | 15 | 30 = 30;
+  private lastPoseOverlayDrawAt = Number.NEGATIVE_INFINITY;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -126,11 +129,28 @@ export class AppShell {
     if (state !== 'ready') this.clearPoseOverlay();
   }
 
+  setPoseOverlayRate(rate: 0 | 10 | 15 | 30): void {
+    this.poseOverlayRate = rate;
+    this.lastPoseOverlayDrawAt = Number.NEGATIVE_INFINITY;
+    if (rate === 0) this.clearPoseOverlay();
+  }
+
+  applyPerformanceAppearance(settings: PerformanceSettings): void {
+    this.root.dataset['cssBlur'] = String(settings.cssBlur);
+    this.root.dataset['effectsQuality'] = settings.effectsQuality;
+    this.root.dataset['cameraBehindGame'] = String(settings.showCameraBehindGame);
+    this.setPoseOverlayRate(settings.poseOverlayRate);
+  }
+
   drawPoseObservations(
     observations: readonly PoseObservation[],
     mirrored = true,
     assignments?: ReadonlyMap<string, PoseOverlayAssignment>,
   ): void {
+    if (this.poseOverlayRate === 0) return;
+    const nowMs = performance.now();
+    if (nowMs - this.lastPoseOverlayDrawAt < 1_000 / this.poseOverlayRate) return;
+    this.lastPoseOverlayDrawAt = nowMs;
     const rect = this.root.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
     // This canvas is diagnostic feedback, not the scoring surface. Keeping it
@@ -245,6 +265,7 @@ export class AppShell {
   }
 
   clearPoseOverlay(): void {
+    this.lastPoseOverlayDrawAt = Number.NEGATIVE_INFINITY;
     const context = this.poseCanvas.getContext('2d');
     context?.clearRect(0, 0, this.poseCanvas.width, this.poseCanvas.height);
   }
@@ -261,6 +282,7 @@ export class AppShell {
   }
 
   showGameChrome(show: boolean): void {
+    this.root.classList.toggle('is-game-active', show);
     this.screenHost.style.display = show ? 'none' : '';
     this.topbar.style.opacity = show ? '0.82' : '';
   }

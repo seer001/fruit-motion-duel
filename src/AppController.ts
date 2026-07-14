@@ -6,7 +6,27 @@ import {
   createHiddenScriptPool,
 } from './core';
 import { IndexedDbEventStore } from './data';
-import { FruitDuelGame, normalizedToLogical } from './game/FruitDuelGame';
+import {
+  AutoPerformanceController,
+  resolveEffectivePerformanceSettings,
+  type AutoPerformanceSnapshot,
+} from './config/auto-performance';
+import {
+  assessPerformanceHealth,
+  getPerformanceHealthPolicy,
+  getPerformancePresetSettings,
+  loadPerformanceSettings,
+  normalizePerformanceSettings,
+  restoreAutoPerformanceSettings,
+  savePerformanceSettings,
+  type PerformancePreset,
+  type PerformanceSettings,
+} from './config/performance';
+import {
+  FruitDuelGame,
+  normalizedToLogical,
+  type FruitDuelCallbacks,
+} from './game/FruitDuelGame';
 import {
   AppFlowStateMachine,
   TournamentManager,
@@ -62,13 +82,14 @@ import {
   TwoPlayerTracker,
   VisionClient,
   assessTrackingSafety,
-  assessCalibrationHealth,
+  assessCalibrationRecognition,
   hasFreshLockedIdentityFrame,
   hasVisionHeartbeatExpired,
   getTorsoGeometry,
   mapCalibratedPointToArena,
   mapCalibratedPointToLane,
   POSE_QUALITY_LANDMARK_COUNT,
+  shouldSubmitInferenceFrame,
   summarizeCalibrationPerformance,
   type PlayerTrackBinding,
   type PlayerTrackingResult,
@@ -140,9 +161,13 @@ export class AppController {
   private readonly shell: AppShell;
   private readonly audio = new AudioManager();
   private readonly camera: CameraController;
-  private readonly vision = new VisionClient();
-  private readonly game: FruitDuelGame;
+  private performanceSettings = loadPerformanceSettings();
+  private readonly autoPerformance = new AutoPerformanceController(this.performanceSettings);
+  private autoPerformanceSnapshot = this.autoPerformance.snapshot;
+  private readonly vision = new VisionClient({ performanceSettings: this.performanceSettings });
+  private game: FruitDuelGame | null = null;
   private readonly eventStore = new IndexedDbEventStore();
+  private applyingPerformanceSettings = false;
 
   private screen: ScreenName = 'home';
   private cameraReady = false;
@@ -174,6 +199,7 @@ export class AppController {
   private calibrationProgressWatch = new Map<string, { progress: number; lastAdvancedAt: number }>();
   private calibrationHandReadyFrames = new Map<string, number>();
   private calibrationIdentityLocked = false;
+  private calibrationIdentityLockErrorNotified = false;
   private trailStates = new Map<string, TrailState>();
   private activePointerOwners = new Map<number, string>();
 
@@ -211,26 +237,8 @@ export class AppController {
   constructor(private readonly root: HTMLElement) {
     this.shell = new AppShell(root);
     this.camera = new CameraController(this.shell.video);
-    this.game = new FruitDuelGame(this.shell.gameHost, this.audio, {
-      onCountdown: (value) => {
-        if (value === null) this.shell.hideCountdown();
-        else this.shell.showCountdown(value);
-      },
-      onStarted: () => this.onRoundStarted(),
-      onScore: (participantId, score) => {
-        this.activeScores[participantId] = score;
-        this.renderHud();
-      },
-      onTick: (remainingMs) => {
-        this.remainingMs = remainingMs;
-        this.renderHud();
-        this.checkVisionHeartbeat();
-      },
-      onFinished: (payload) => void this.onRoundFinished(payload),
-      onNotice: (message, kind) => {
-        if (kind !== 'slice') this.shell.toast(message, kind === 'bomb' ? 'error' : 'success', 1700);
-      },
-    });
+    this.shell.gameHost.dataset['rendererState'] = 'absent';
+    this.applyAutoPerformanceSnapshot(this.autoPerformanceSnapshot, false);
 
     this.vision.onPoseFrame((frame) => this.handlePoseFrame(frame));
     this.vision.onError((error) => {
@@ -280,8 +288,110 @@ export class AppController {
     this.camera.stop();
     this.vision.close();
     this.eventStore.close();
-    this.game.destroy();
+    this.destroyGameRenderer();
     this.shell.destroy();
+  }
+
+  private gameCallbacks(): FruitDuelCallbacks {
+    return {
+      onCountdown: (value) => {
+        if (value === null) this.shell.hideCountdown();
+        else this.shell.showCountdown(value);
+      },
+      onStarted: () => this.onRoundStarted(),
+      onScore: (participantId, score) => {
+        this.activeScores[participantId] = score;
+        this.renderHud();
+      },
+      onTick: (remainingMs) => {
+        this.remainingMs = remainingMs;
+        this.renderHud();
+        this.checkVisionHeartbeat();
+      },
+      onFinished: (payload) => void this.onRoundFinished(payload),
+      onNotice: (message, kind) => {
+        if (kind !== 'slice') {
+          this.shell.toast(message, kind === 'bomb' ? 'error' : 'success', 1700);
+        }
+      },
+    };
+  }
+
+  private effectivePerformanceSettings(
+    snapshot = this.autoPerformanceSnapshot,
+  ): PerformanceSettings {
+    return resolveEffectivePerformanceSettings(this.performanceSettings, snapshot);
+  }
+
+  private applyAutoPerformanceSnapshot(
+    snapshot: AutoPerformanceSnapshot,
+    resetTimingSamples: boolean,
+  ): void {
+    this.autoPerformanceSnapshot = snapshot;
+    const effective = this.effectivePerformanceSettings(snapshot);
+    this.root.dataset['autoPerformanceStage'] = snapshot.autoEnabled
+      ? String(snapshot.stage)
+      : 'fixed';
+    this.shell.applyPerformanceAppearance(effective);
+    this.vision.setAutoRuntimePolicy({
+      targetFps: effective.inferenceTargetFps,
+      visionLoadReductionAllowed: snapshot.runtime.visionLoadReductionAllowed,
+    });
+    this.game?.setTargetFps(effective.gameRenderFps);
+    this.game?.setEffectsQuality(effective.effectsQuality);
+    this.reconcileRendererInitialization(effective);
+    if (resetTimingSamples) {
+      this.inferenceSamples = [];
+      this.pipelineSamples = [];
+      this.inferenceTimestamps = [];
+    }
+  }
+
+  private reconcileRendererInitialization(
+    effective = this.effectivePerformanceSettings(),
+  ): void {
+    if (this.game === null || this.currentRoundActive || this.screen === 'game') return;
+    const active = this.game.currentRenderSettings;
+    if (
+      active.antialias !== effective.antialias ||
+      active.transparent !== effective.showCameraBehindGame
+    ) {
+      this.destroyGameRenderer();
+    }
+  }
+
+  private async ensureGameRenderer(): Promise<FruitDuelGame> {
+    if (this.game === null) {
+      const effective = this.effectivePerformanceSettings();
+      this.shell.gameHost.dataset['rendererState'] = 'creating';
+      this.game = new FruitDuelGame(
+        this.shell.gameHost,
+        this.audio,
+        {
+          targetFps: effective.gameRenderFps,
+          antialias: effective.antialias,
+          transparent: effective.showCameraBehindGame,
+          effectsQuality: effective.effectsQuality,
+        },
+        this.gameCallbacks(),
+      );
+    }
+    const game = this.game;
+    await game.ready;
+    if (this.game !== game) throw new Error('遊戲 renderer 在初始化期間已被取代。');
+    return game;
+  }
+
+  private sleepGameRenderer(): void {
+    this.game?.sleep();
+    this.shell.gameHost.dataset['rendererState'] = this.game === null ? 'absent' : 'sleeping';
+  }
+
+  private destroyGameRenderer(): void {
+    const game = this.game;
+    this.game = null;
+    game?.destroy();
+    this.shell.gameHost.dataset['rendererState'] = 'absent';
   }
 
   private async renderHome(): Promise<void> {
@@ -299,6 +409,7 @@ export class AppController {
         ...(activeDeviceId === undefined ? {} : { activeDeviceId }),
         savedEvent: this.savedEvent,
         devices: this.devices,
+        performanceSettings: this.performanceSettings,
       }),
       true,
     );
@@ -346,6 +457,147 @@ export class AppController {
         void this.renderHome();
       });
     });
+    this.bindPerformanceSettings(screen);
+  }
+
+  private bindPerformanceSettings(screen: HTMLElement): void {
+    const form = screen.querySelector<HTMLFormElement>('#performance-settings-form');
+    if (!form) return;
+    const advanced = form.querySelector<HTMLDetailsElement>('.performance-advanced');
+    form.querySelectorAll<HTMLInputElement>('input[name="performancePreset"]').forEach((input) => {
+      input.addEventListener('change', () => {
+        const preset = input.value as PerformancePreset;
+        if (preset === 'custom') {
+          if (advanced) advanced.open = true;
+          return;
+        }
+        const cameraOverride = form.elements.namedItem('showCameraBehindGame') as HTMLInputElement | null;
+        const settings = {
+          ...getPerformancePresetSettings(preset),
+          showCameraBehindGame: cameraOverride?.checked ?? true,
+        };
+        this.writePerformanceForm(form, settings);
+      });
+    });
+
+    form.querySelectorAll<HTMLInputElement | HTMLSelectElement>(
+      '.performance-advanced input, .performance-advanced select',
+    ).forEach((control) => {
+      control.addEventListener('change', () => {
+        if (control.getAttribute('name') === 'showCameraBehindGame') return;
+        const custom = form.querySelector<HTMLInputElement>(
+          'input[name="performancePreset"][value="custom"]',
+        );
+        if (custom) custom.checked = true;
+        if (control.getAttribute('name') === 'spectatorReserve' &&
+          control instanceof HTMLInputElement && control.checked) {
+          const candidates = form.elements.namedItem('maximumPoseCandidates') as HTMLSelectElement | null;
+          if (candidates) candidates.value = '3';
+        }
+      });
+    });
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void this.applyPerformanceSettings(this.readPerformanceForm(form), true);
+    });
+    requireElement<HTMLButtonElement>(form, '#restore-auto-settings').addEventListener('click', () => {
+      void this.applyPerformanceSettings(getPerformancePresetSettings('auto'), false, true);
+    });
+  }
+
+  private writePerformanceForm(form: HTMLFormElement, settings: PerformanceSettings): void {
+    const setValue = (name: string, value: string): void => {
+      const control = form.elements.namedItem(name);
+      if (control instanceof HTMLSelectElement) control.value = value;
+    };
+    const setChecked = (name: string, value: boolean): void => {
+      const control = form.elements.namedItem(name);
+      if (control instanceof HTMLInputElement) control.checked = value;
+    };
+    setValue('modelPreference', settings.modelPreference);
+    setValue('inferenceMaxDimension', String(settings.inferenceMaxDimension));
+    setValue('inferenceTargetFps', String(settings.inferenceTargetFps));
+    setValue('maximumPoseCandidates', String(settings.maximumPoseCandidates));
+    setValue('gameRenderFps', String(settings.gameRenderFps));
+    setValue('effectsQuality', settings.effectsQuality);
+    setValue('poseOverlayRate', String(settings.poseOverlayRate));
+    setChecked('spectatorReserve', settings.spectatorReserve);
+    setChecked('antialias', settings.antialias);
+    setChecked('showCameraBehindGame', settings.showCameraBehindGame);
+    setChecked('cssBlur', settings.cssBlur);
+  }
+
+  private readPerformanceForm(form: HTMLFormElement): PerformanceSettings {
+    const data = new FormData(form);
+    return normalizePerformanceSettings({
+      version: 1,
+      preset: String(data.get('performancePreset') ?? 'auto'),
+      modelPreference: String(data.get('modelPreference') ?? 'auto'),
+      inferenceMaxDimension: Number(data.get('inferenceMaxDimension')),
+      inferenceTargetFps: Number(data.get('inferenceTargetFps')),
+      maximumPoseCandidates: Number(data.get('maximumPoseCandidates')),
+      spectatorReserve: data.has('spectatorReserve'),
+      gameRenderFps: Number(data.get('gameRenderFps')),
+      antialias: data.has('antialias'),
+      showCameraBehindGame: data.has('showCameraBehindGame'),
+      effectsQuality: String(data.get('effectsQuality') ?? 'medium'),
+      poseOverlayRate: Number(data.get('poseOverlayRate')),
+      cssBlur: data.has('cssBlur'),
+    });
+  }
+
+  private async applyPerformanceSettings(
+    input: PerformanceSettings,
+    persist: boolean,
+    clearStoredSettings = false,
+  ): Promise<void> {
+    if (this.applyingPerformanceSettings) return;
+    if (this.currentRoundActive || this.screen === 'game' || this.screen === 'calibration') {
+      this.shell.toast('校正、倒數與遊戲進行中無法變更效能設定。', 'error');
+      return;
+    }
+    this.applyingPerformanceSettings = true;
+    const status = this.root.querySelector<HTMLElement>('[data-performance-apply-status]');
+    const controls = this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>(
+      '#performance-settings-form input, #performance-settings-form select, #performance-settings-form button',
+    );
+    controls.forEach((control) => { control.disabled = true; });
+    if (status) status.textContent = '正在套用設定…';
+    const previous = this.performanceSettings;
+    try {
+      const next = normalizePerformanceSettings(input);
+      await this.vision.applyPerformanceSettings(next);
+      this.performanceSettings = clearStoredSettings
+        ? restoreAutoPerformanceSettings()
+        : persist
+          ? savePerformanceSettings(next)
+          : next;
+      this.applyAutoPerformanceSnapshot(
+        this.autoPerformance.setPreset(this.performanceSettings),
+        true,
+      );
+      this.modelReady = this.vision.state === 'ready';
+      this.shell.toast(
+        clearStoredSettings
+          ? '已恢復自動效能設定。'
+          : persist
+            ? '效能設定已套用並保存在這台裝置。'
+            : '效能設定已套用。',
+        'success',
+      );
+    } catch (error) {
+      await this.vision.applyPerformanceSettings(previous).catch(() => undefined);
+      this.modelReady = this.vision.state === 'ready';
+      this.shell.toast(
+        `效能設定未套用：${error instanceof Error ? error.message : '模型或 renderer 重新設定失敗。'}`,
+        'error',
+        6000,
+      );
+    } finally {
+      this.applyingPerformanceSettings = false;
+      if (this.screen === 'home') await this.renderHome();
+    }
   }
 
   private async connectCamera(deviceId?: string): Promise<boolean> {
@@ -454,7 +706,15 @@ export class AppController {
   private startInferenceLoop(): void {
     this.stopInferenceLoop();
     const submitCurrentFrame = (timestamp: number): void => {
-      if (this.cameraReady && this.vision.state === 'ready' && timestamp - this.lastInferenceSubmitAt >= 32) {
+      if (
+        this.cameraReady &&
+        this.vision.state === 'ready' &&
+        shouldSubmitInferenceFrame(
+          timestamp,
+          this.lastInferenceSubmitAt,
+          this.effectivePerformanceSettings().inferenceTargetFps,
+        )
+      ) {
         if (this.shell.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
           this.vision.submitFrame(this.shell.video, timestamp);
           this.lastInferenceSubmitAt = timestamp;
@@ -498,7 +758,8 @@ export class AppController {
   }
 
   private handlePoseFrame(frame: PoseFrame): void {
-    this.lastPoseFrameReceivedAt = performance.now();
+    const receivedAtMs = performance.now();
+    this.lastPoseFrameReceivedAt = receivedAtMs;
     this.lastPoseObservations = frame.poses;
     this.lastDetectedPoseCount = frame.detectedPoseCount ?? frame.poses.length;
     this.inferenceSamples.push(frame.inferenceMs);
@@ -506,10 +767,11 @@ export class AppController {
       this.pipelineSamples.push(frame.performance.pipelineMs);
       this.lastVisionPerformance = frame.performance;
     }
-    this.inferenceTimestamps.push(performance.now());
+    this.inferenceTimestamps.push(receivedAtMs);
     if (this.inferenceSamples.length > 240) this.inferenceSamples.shift();
     if (this.pipelineSamples.length > 240) this.pipelineSamples.shift();
     if (this.inferenceTimestamps.length > 240) this.inferenceTimestamps.shift();
+    this.observeAutoPerformance(receivedAtMs);
     this.refreshDiagnostics();
     if (
       !this.tracker ||
@@ -552,6 +814,27 @@ export class AppController {
       this.updateCameraTrails(tracked);
       this.handleTrackingSafety(tracked);
     }
+  }
+
+  private observeAutoPerformance(nowMs: number): void {
+    if (this.performanceSettings.preset !== 'auto') return;
+    const effective = this.effectivePerformanceSettings();
+    const policy = getPerformanceHealthPolicy(effective);
+    const metrics = summarizeCalibrationPerformance({
+      inferenceSamples: this.inferenceSamples,
+      pipelineSamples: this.pipelineSamples,
+      inferenceTimestamps: this.inferenceTimestamps,
+      nowMs,
+      minimumUsableFps: policy.minimumUsableFps,
+      ...(this.lastVisionPerformance?.backend === undefined
+        ? {}
+        : { backend: this.lastVisionPerformance.backend }),
+    });
+    if (!metrics.ready) return;
+    const snapshot = this.autoPerformance.observe(
+      assessPerformanceHealth(metrics, effective).status,
+    );
+    if (snapshot.changed) this.applyAutoPerformanceSnapshot(snapshot, true);
   }
 
   private renderSoloPracticeSetup(): void {
@@ -771,7 +1054,9 @@ export class AppController {
     if (players.length < 1 || players.length > 2) {
       throw new Error('校正只支援一位或兩位玩家。');
     }
+    this.sleepGameRenderer();
     this.vision.setExpectedPoseCount(players.length as 1 | 2);
+    this.vision.reportCalibrationStall(false, false);
     this.currentPlayers = players;
     this.calibrationContinuation = continuation;
     const bindings = players.map(({ participant, lane }) => ({
@@ -785,7 +1070,11 @@ export class AppController {
           mirrored: true,
           allowBothWrists,
         });
-    this.calibrationCollector = new CalibrationCollector(bindings, { minimumSamples: 24, maximumSamples: 90 });
+    this.calibrationCollector = new CalibrationCollector(bindings, {
+      minimumSamples: 16,
+      maximumSamples: 90,
+      minimumEarSpanSamples: 6,
+    });
     this.calibrationProfiles.clear();
     this.adaptiveCalibration.clear();
     this.trailStates.clear();
@@ -795,6 +1084,7 @@ export class AppController {
     this.calibrationProgressWatch.clear();
     this.calibrationHandReadyFrames.clear();
     this.calibrationIdentityLocked = false;
+    this.calibrationIdentityLockErrorNotified = false;
     for (const { participant } of players) {
       this.calibrationHandReadyFrames.set(participant.id, 0);
     }
@@ -864,10 +1154,50 @@ export class AppController {
         this.calibrationProfiles.get(participant.id),
       );
       if (profiles.every((profile): profile is CalibrationProfile => profile !== undefined)) {
-        this.tracker.lockIdentities(profiles);
-        this.calibrationIdentityLocked = true;
-        for (const { participant } of this.currentPlayers) {
-          this.calibrationHandReadyFrames.set(participant.id, 0);
+        try {
+          this.tracker.lockIdentities(profiles);
+          this.calibrationIdentityLocked = true;
+          this.calibrationIdentityLockErrorNotified = false;
+          for (const { participant } of this.currentPlayers) {
+            this.calibrationHandReadyFrames.set(participant.id, 0);
+          }
+        } catch (error) {
+          const changedParticipants = profiles.flatMap((profile) => {
+            const calibratedTracklet = profile.identityAnchor?.headTrackletId;
+            const liveTracklet = this.lastTrackerFrame?.players.find(
+              ({ participantId }) => participantId === profile.participantId,
+            )?.headTrackletId;
+            return calibratedTracklet !== undefined &&
+              liveTracklet !== null &&
+              liveTracklet !== undefined &&
+              liveTracklet !== calibratedTracklet
+              ? [profile.participantId]
+              : [];
+          });
+          for (const participantId of changedParticipants) {
+            this.calibrationCollector.clear(participantId);
+            this.calibrationProfiles.delete(participantId);
+            this.calibrationHandReadyFrames.set(participantId, 0);
+            this.calibrationProgressWatch.delete(participantId);
+          }
+          if (changedParticipants.length > 0) {
+            this.adaptiveCalibration.clear();
+            for (const profile of this.calibrationProfiles.values()) {
+              this.adaptiveCalibration.seed(profile);
+            }
+          }
+          if (!this.calibrationIdentityLockErrorNotified) {
+            this.shell.toast(
+              changedParticipants.length > 0
+                ? '偵測到玩家頭部追蹤已更換；只重新收集受影響的一側。'
+                : error instanceof Error
+                  ? error.message
+                  : '身份封存尚未完成，請維持頭部與雙肩清楚入鏡。',
+              'info',
+              4000,
+            );
+            this.calibrationIdentityLockErrorNotified = true;
+          }
         }
       }
     }
@@ -907,10 +1237,21 @@ export class AppController {
     for (const { participant } of this.currentPlayers) {
       const card = this.root.querySelector<HTMLElement>(`[data-player-id="${CSS.escape(participant.id)}"]`);
       const state = card?.querySelector<HTMLElement>('.calibration-state');
-      const progress = this.calibrationCollector?.progress(participant.id) ?? 0;
+      const collector = this.calibrationCollector?.diagnostics(participant.id);
+      const handFrames = this.calibrationHandReadyFrames.get(participant.id) ?? 0;
+      const fullyReady = this.calibrationIdentityLocked &&
+        handFrames >= CALIBRATION_HAND_READY_FRAMES;
       if (state) {
-        state.textContent = progress >= 1 ? '✓ 校正完成' : `${Math.round(progress * 100)}% 偵測中`;
-        state.classList.toggle('is-ready', progress >= 1);
+        state.textContent = fullyReady
+          ? '✓ 身份與主手完成'
+          : this.calibrationIdentityLocked
+            ? `🔒 身份已封存 · 主手 ${handFrames}/${CALIBRATION_HAND_READY_FRAMES}`
+            : this.calibrationProfiles.has(participant.id)
+              ? '✓ 此側完成 · 等待原子封存'
+              : collector === null || collector === undefined
+                ? '等待校正資料'
+                : `${collector.sampleCount}/${collector.minimumSamples} 樣本 · ${collector.status === 'ready' ? '準備封存' : '獨立收集中'}`;
+        state.classList.toggle('is-ready', fullyReady);
       }
     }
     const approve = this.root.querySelector<HTMLButtonElement>('#approve-calibration');
@@ -930,11 +1271,14 @@ export class AppController {
     const frame = this.lastTrackerFrame;
     const expectedPlayers = this.currentPlayers.length;
     const nowMs = performance.now();
+    const effectivePerformance = this.effectivePerformanceSettings();
+    const performancePolicy = getPerformanceHealthPolicy(effectivePerformance);
     const performanceSnapshot = summarizeCalibrationPerformance({
       inferenceSamples: this.inferenceSamples,
       pipelineSamples: this.pipelineSamples,
       inferenceTimestamps: this.inferenceTimestamps,
       nowMs,
+      minimumUsableFps: performancePolicy.minimumUsableFps,
       ...(this.lastVisionPerformance?.backend === undefined
         ? {}
         : { backend: this.lastVisionPerformance.backend }),
@@ -948,7 +1292,7 @@ export class AppController {
 
     let recognizedHandCount = 0;
     let calibrationStalled = false;
-    for (const { participant } of this.currentPlayers) {
+    for (const { participant, lane: participantLane } of this.currentPlayers) {
       const player = frame?.players.find(
         ({ participantId }) => participantId === participant.id,
       );
@@ -962,10 +1306,12 @@ export class AppController {
       // player lock, structural support, active-arm confidence and the guarded
       // current-frame blade.
       const handConfidence = player?.confidence ?? 0;
-      const handRecognized =
+      const handObserved =
         player?.state === 'tracking' &&
         player.activeWrist !== null &&
         handConfidence >= 0.55;
+      const handFrames = this.calibrationHandReadyFrames.get(participant.id) ?? 0;
+      const handRecognized = handFrames >= CALIBRATION_HAND_READY_FRAMES;
       if (handRecognized) recognizedHandCount += 1;
 
       const progress = this.calibrationCollector?.progress(participant.id) ?? 0;
@@ -973,24 +1319,32 @@ export class AppController {
       if (
         watchedProgress === undefined ||
         progress > watchedProgress.progress + 0.001 ||
-        player?.state !== 'tracking' ||
         progress >= 1
       ) {
         this.calibrationProgressWatch.set(participant.id, {
           progress,
           lastAdvancedAt: nowMs,
         });
-      } else if (nowMs - watchedProgress.lastAdvancedAt >= 1_500) {
+      } else if (
+        player?.state === 'tracking' &&
+        nowMs - watchedProgress.lastAdvancedAt >= 1_500
+      ) {
         calibrationStalled = true;
       }
 
       const card = this.root.querySelector<HTMLElement>(
         `[data-player-id="${CSS.escape(participant.id)}"]`,
       );
+      const lane = frame?.candidateDiagnostics.laneDiagnostics[participantLane];
+      const collector = this.calibrationCollector?.diagnostics(participant.id);
       const qualityElement = card?.querySelector<HTMLElement>('[data-player-quality]');
       const reliableElement = card?.querySelector<HTMLElement>('[data-player-reliable]');
       const handElement = card?.querySelector<HTMLElement>('[data-player-hand]');
-      const trackingElement = card?.querySelector<HTMLElement>('[data-player-tracking]');
+      const laneElement = card?.querySelector<HTMLElement>('[data-player-lane-candidates]');
+      const samplesElement = card?.querySelector<HTMLElement>('[data-player-samples]');
+      const earsElement = card?.querySelector<HTMLElement>('[data-player-ears]');
+      const fallbackElement = card?.querySelector<HTMLElement>('[data-player-fallback]');
+      const identityElement = card?.querySelector<HTMLElement>('[data-player-identity]');
       if (qualityElement) {
         qualityElement.textContent = quality === undefined
           ? '—'
@@ -1000,29 +1354,47 @@ export class AppController {
         reliableElement.textContent = `${quality?.reliableLandmarkCount ?? 0}/${POSE_QUALITY_LANDMARK_COUNT}`;
       }
       if (handElement) {
-        handElement.textContent = `${Math.round(handConfidence * 100)}% ${handRecognized ? '✓ 可切擊' : '未就緒'}`;
+        handElement.textContent = `${Math.round(handConfidence * 100)}% · ${handFrames}/${CALIBRATION_HAND_READY_FRAMES} ${handRecognized ? '✓ 穩定' : handObserved ? '確認中' : '未就緒'}`;
         handElement.classList.toggle('is-ready', handRecognized);
       }
-      if (trackingElement) {
-        trackingElement.textContent = player === undefined
-          ? '等待分配'
-          : player.identity.state === 'locked'
-            ? '🔒 頭部身份已封存'
-            : player.identity.state === 'recalibration-required'
-              ? '身份需重新校正'
-              : player.identity.state === 'occluded'
-                ? '頭部暫時遮擋'
-                : player.state === 'tracking'
-                  ? '本幀已追蹤，等待封存'
-                  : player.state === 'acquiring'
-                    ? '取得頭部錨點中'
-                    : player.state === 'holding'
-                      ? '短暫遮擋'
-                      : '已失追';
+      if (laneElement) {
+        laneElement.textContent = lane === undefined
+          ? '原始 0 · 合格 0 · 分配 0'
+          : `原始 ${lane.rawCandidateCount} · 合格 ${lane.acceptedCandidateCount} · 分配 ${lane.assignedCandidateCount}${lane.ambiguousCandidateCount > 0 ? ` · 模糊 ${lane.ambiguousCandidateCount}` : ''}`;
+      }
+      if (samplesElement) {
+        samplesElement.textContent = collector === null || collector === undefined
+          ? '0/16'
+          : `${collector.sampleCount}/${collector.minimumSamples} · ${collector.status === 'frozen' ? '已凍結' : collector.status === 'ready' ? '可封存' : '收集中'}`;
+      }
+      if (earsElement) {
+        earsElement.textContent = collector === null || collector === undefined
+          ? '0/6'
+          : `${collector.earSpanSampleCount}/${collector.minimumEarSpanSamples}${collector.earSpanReady ? ' ✓ 可用' : ''}`;
+      }
+      if (fallbackElement) {
+        fallbackElement.textContent = collector?.fallbackReady
+          ? '✓ 頭肩／軀幹穩定'
+          : '尚未達穩定門檻';
+      }
+      if (identityElement) {
+        const sourceLabel = collector?.identitySource === 'ear-span'
+          ? '耳距'
+          : collector?.identitySource === 'shoulder-torso-fallback'
+            ? '結構備援'
+            : '待確認';
+        identityElement.textContent = player?.identity.state === 'locked'
+          ? `🔒 原子封存 · ${sourceLabel}`
+          : this.calibrationProfiles.has(participant.id)
+            ? `此側凍結 · 等待另一側 · ${sourceLabel}`
+            : collector?.headTrackletId === null || collector?.headTrackletId === undefined
+              ? '等待穩定頭部 tracklet'
+              : `tracklet #${collector.headTrackletId} · ${sourceLabel}`;
       }
     }
 
-    const health = assessCalibrationHealth({
+    const recognitionHealth = assessCalibrationRecognition({
+      frameReceived: frame !== null,
       expectedPlayers,
       rawPoseCount,
       acceptedCandidateCount,
@@ -1030,29 +1402,95 @@ export class AppController {
       lockedPlayerCount,
       recognizedHandCount,
       calibrationStalled,
-      performance: performanceSnapshot,
     });
     const diagnostics = this.root.querySelector<HTMLElement>('[data-calibration-diagnostics]');
     if (!diagnostics) return;
-    diagnostics.dataset['health'] = health.code;
+    const recognitionPanel = diagnostics.querySelector<HTMLElement>('[data-recognition-health]');
+    const performancePanel = diagnostics.querySelector<HTMLElement>('[data-performance-health]');
+    diagnostics.dataset['health'] = recognitionHealth.code;
+    if (recognitionPanel) recognitionPanel.dataset['health'] = recognitionHealth.code;
     const setText = (selector: string, value: string): void => {
       const element = diagnostics.querySelector<HTMLElement>(selector);
       if (element) element.textContent = value;
     };
-    setText('[data-diag-health-label]', health.label);
-    setText('[data-diag-health-instruction]', health.instruction);
+    setText('[data-diag-recognition-label]', recognitionHealth.label);
+    setText('[data-diag-recognition-instruction]', recognitionHealth.instruction);
     setText('[data-diag-raw]', String(rawPoseCount));
     setText('[data-diag-accepted]', `${acceptedCandidateCount}/${expectedPlayers}`);
     setText('[data-diag-assigned]', `${assignedPlayerCount}/${expectedPlayers}`);
     setText('[data-diag-locked]', `${lockedPlayerCount}/${expectedPlayers}`);
-    setText(
-      '[data-diag-throughput]',
-      `${performanceSnapshot.backend.toUpperCase()} · ${performanceSnapshot.fps.toFixed(1)} FPS`,
+    const performanceHealth = assessPerformanceHealth(performanceSnapshot, effectivePerformance);
+    const performanceStatus = performanceSnapshot.ready ? performanceHealth.status : 'measuring';
+    if (performancePanel) performancePanel.dataset['health'] = performanceStatus;
+    const performanceLabel = performanceStatus === 'measuring'
+      ? '正在量測效能…'
+      : performanceStatus === 'good'
+        ? '效能符合目前設定'
+        : performanceStatus === 'degraded'
+          ? '效能低於目標，但仍可使用'
+          : '效能不足';
+    const limitingLabels = performanceHealth.limitingFactors.map((factor) =>
+      factor === 'fps' ? '吞吐' : factor === 'inference' ? '推論延遲' : '全流程延遲',
     );
+    const performanceInstruction = performanceStatus === 'measuring'
+      ? '持續收集推論與全流程樣本；辨識狀態會獨立顯示。'
+      : performanceStatus === 'good'
+        ? '目前吞吐與延遲符合所選 preset 的共同門檻。'
+        : `${limitingLabels.join('、') || '效能'}超出目前 preset 門檻${this.performanceSettings.preset === 'auto' ? '；Auto 會依序降低效果／骨架、renderer，再允許 Vision 降載。' : '；固定 preset 不會自動改寫你的設定。'}`;
+    const presetLabel: Record<PerformancePreset, string> = {
+      auto: 'Auto',
+      performance: '效能優先',
+      balanced: '均衡',
+      quality: '品質優先',
+      custom: '進階自訂',
+    };
+    const activePerformance = this.lastVisionPerformance;
+    const autoStage = this.autoPerformanceSnapshot.stage === null
+      ? ''
+      : this.autoPerformanceSnapshot.stage === 'quality'
+        ? ' · Auto Quality'
+        : ` · Auto Stage ${this.autoPerformanceSnapshot.stage}`;
+    setText('[data-diag-performance-label]', performanceLabel);
+    setText('[data-diag-performance-instruction]', performanceInstruction);
+    setText(
+      '[data-diag-profile]',
+      `${presetLabel[this.performanceSettings.preset]}${autoStage} · 目標 ${performancePolicy.targetFps} FPS${activePerformance?.adaptiveMode ? ` · ${activePerformance.adaptiveMode}` : ''}`,
+    );
+    setText(
+      '[data-diag-model]',
+      activePerformance === undefined
+        ? 'STARTING'
+        : `${activePerformance.backend.toUpperCase()} · ${(activePerformance.modelTier ?? this.performanceSettings.modelPreference).toUpperCase()} · ${activePerformance.maxPoses ?? this.performanceSettings.maximumPoseCandidates} 候選`,
+    );
+    setText(
+      '[data-diag-input]',
+      activePerformance === undefined
+        ? `上限 ${this.performanceSettings.inferenceMaxDimension}px`
+        : `${activePerformance.inputWidth}×${activePerformance.inputHeight} · 上限 ${activePerformance.maximumInputDimension ?? this.performanceSettings.inferenceMaxDimension}px`,
+    );
+    setText('[data-diag-throughput]', `${performanceSnapshot.fps.toFixed(1)} / ${performancePolicy.targetFps} FPS`);
     setText(
       '[data-diag-latency]',
-      `推論 ${performanceSnapshot.inferenceP95Ms.toFixed(0)} / 全流程 ${performanceSnapshot.pipelineP95Ms.toFixed(0)} ms`,
+      `推論 ${performanceSnapshot.inferenceP95Ms.toFixed(0)}/${performancePolicy.maximumInferenceP95Ms} · 全流程 ${performanceSnapshot.pipelineP95Ms.toFixed(0)}/${performancePolicy.maximumPipelineP95Ms} ms`,
     );
+    const activeRenderer = this.game?.currentRenderSettings ?? {
+      targetFps: effectivePerformance.gameRenderFps,
+      antialias: effectivePerformance.antialias,
+      transparent: effectivePerformance.showCameraBehindGame,
+      effectsQuality: effectivePerformance.effectsQuality,
+    };
+    setText(
+      '[data-diag-renderer]',
+      `${activeRenderer.targetFps} FPS · AA ${activeRenderer.antialias ? '開' : '關'} · ${activeRenderer.transparent ? '透明' : '不透明'} · 特效 ${activeRenderer.effectsQuality} · ${this.shell.gameHost.dataset['rendererState'] ?? 'absent'}`,
+    );
+
+    const activeCandidateLimit = activePerformance?.maxPoses ??
+      this.performanceSettings.maximumPoseCandidates;
+    const candidatePressure =
+      expectedPlayers === 2 &&
+      rawPoseCount >= activeCandidateLimit &&
+      (frame?.unassignedObservations.length ?? 0) > 0;
+    this.vision.reportCalibrationStall(calibrationStalled, candidatePressure);
   }
 
   private hasFreshLockedIdentities(players: readonly RuntimePlayer[]): boolean {
@@ -1240,7 +1678,24 @@ export class AppController {
     this.shell.showGameChrome(true);
     this.renderHud();
     this.bindHostControls(kind);
-    void this.game.prepareRound(config, 3);
+    void this.ensureGameRenderer()
+      .then((game) => {
+        if (this.screen === 'game' && this.currentRoundKind === kind) {
+          game.wake();
+          this.shell.gameHost.dataset['rendererState'] = 'awake';
+          return game.prepareRound(config, 3);
+        }
+        game.sleep();
+        this.shell.gameHost.dataset['rendererState'] = 'sleeping';
+        return undefined;
+      })
+      .catch((error: unknown) => {
+        this.shell.toast(
+          error instanceof Error ? error.message : '遊戲 renderer 啟動失敗。',
+          'error',
+          5000,
+        );
+      });
   }
 
   private bindHostControls(kind: RoundKind): void {
@@ -1596,7 +2051,7 @@ export class AppController {
   }
 
   private async abortCurrentRound(reason = '主持人技術中止'): Promise<void> {
-    this.game.abort();
+    this.game?.abort();
     this.currentRoundActive = false;
     this.resetVisibleGame();
     if (this.currentRoundKind === 'solo-practice') {
@@ -1678,7 +2133,7 @@ export class AppController {
     this.gamePaused = true;
     this.trackingPaused = tracking;
     this.trackingRecoveryAnnounced = false;
-    this.game.pause(reason);
+    this.game?.pause(reason);
     this.shell.showPause(
       reason,
       tracking ? trackingDetail : '計時、水果與計分均已凍結。',
@@ -1701,7 +2156,7 @@ export class AppController {
     this.gamePaused = false;
     this.trackingPaused = false;
     this.trackingRecoveryAnnounced = false;
-    this.game.resume();
+    this.game?.resume();
     this.shell.hidePause();
     if (this.currentRoundKind === 'tournament' && this.currentAssignment?.phase !== 'tiebreak' && this.flow?.can('resume-half')) {
       this.flow.send('resume-half');
@@ -1852,6 +2307,8 @@ export class AppController {
     }
     this.trackingRecalibrationActive = false;
     this.screen = 'game';
+    this.game?.wake();
+    this.shell.gameHost.dataset['rendererState'] = this.game === null ? 'absent' : 'awake';
     this.shell.clearScreen();
     this.shell.showGameChrome(true);
     this.renderHud();
@@ -1865,7 +2322,7 @@ export class AppController {
     this.clearTrackingSafetyTimers();
     this.shell.toast('重新校正未通過；只作廢目前小局並抽取新腳本。', 'error', 5000);
     if (this.currentRoundKind === 'practice' && this.manager && this.currentHeatId) {
-      this.game.abort();
+      this.game?.abort();
       this.currentRoundActive = false;
       this.resetVisibleGame();
       this.prepareCurrentTournamentHalf();
@@ -1939,7 +2396,7 @@ export class AppController {
         ));
       });
     }
-    this.game.updateTrails(trails);
+    this.game?.updateTrails(trails);
   }
 
   private appendTrail(
@@ -2007,6 +2464,8 @@ export class AppController {
     this.gamePaused = false;
     this.trackingPaused = false;
     this.currentRoundActive = false;
+    this.sleepGameRenderer();
+    this.reconcileRendererInitialization();
   }
 
   private async saveEvent(): Promise<void> {
@@ -2104,15 +2563,33 @@ export class AppController {
     const recentCutoff = performance.now() - 1000;
     const fps = this.inferenceTimestamps.filter((time) => time >= recentCutoff).length;
     const performanceMetrics = this.lastVisionPerformance;
+    const effectivePerformance = this.effectivePerformanceSettings();
+    const performancePolicy = getPerformanceHealthPolicy(effectivePerformance);
+    const performanceHealth = assessPerformanceHealth({
+      fps,
+      inferenceP95Ms: inferenceP95,
+      pipelineP95Ms: pipelineP95,
+    }, effectivePerformance);
+    const activeRenderer = this.game?.currentRenderSettings ?? {
+      targetFps: effectivePerformance.gameRenderFps,
+      antialias: effectivePerformance.antialias,
+      transparent: effectivePerformance.showCameraBehindGame,
+      effectsQuality: effectivePerformance.effectsQuality,
+    };
+    const autoRuntimeLabel = this.autoPerformanceSnapshot.autoEnabled
+      ? `Auto ${String(this.autoPerformanceSnapshot.stage)}`
+      : 'fixed';
     this.diagnosticsElement.textContent = [
       'FRUIT MOTION DIAGNOSTICS',
       `Camera: ${this.camera.session?.deviceCategory === 'iphone-continuity' ? 'iPhone Continuity RGB · ' : ''}${this.camera.session?.width ?? 0}×${this.camera.session?.height ?? 0} @ ${Math.round(this.camera.session?.frameRate ?? 0)}fps`,
       `Vision: ${(performanceMetrics?.modelTier ?? 'starting').toUpperCase()} · 33 model landmarks / ${POSE_QUALITY_LANDMARK_COUNT} game anchors · ${performanceMetrics?.backend ?? 'starting'} · ${this.vision.state}`,
       `Adaptive: ${performanceMetrics?.adaptiveMode ?? 'warming-up'} · ${performanceMetrics?.diagnosis ?? 'warming-up'} · max poses ${performanceMetrics?.maxPoses ?? 0}`,
+      `Preset: ${this.performanceSettings.preset} · ${autoRuntimeLabel} · ${performanceHealth.status} · target ${performanceMetrics?.targetFps ?? effectivePerformance.inferenceTargetFps}fps · max input ${performanceMetrics?.maximumInputDimension ?? this.performanceSettings.inferenceMaxDimension}px`,
       `Inference: ${fps}fps · p95 ${inferenceP95.toFixed(1)}ms`,
       `Pipeline: p95 ${pipelineP95.toFixed(1)}ms · input ${performanceMetrics?.inputWidth ?? 0}×${performanceMetrics?.inputHeight ?? 0}`,
       `Last stages: capture ${performanceMetrics?.captureMs.toFixed(1) ?? '0.0'} · queue ${performanceMetrics?.workerQueueMs.toFixed(1) ?? '0.0'} · inference ${performanceMetrics?.inferenceMs.toFixed(1) ?? '0.0'} · return ${performanceMetrics?.resultTransferMs.toFixed(1) ?? '0.0'} ms`,
-      `Target: ≥20fps · inference p95 ≤45ms · pipeline p95 ≤100ms`,
+      `Target: ${performancePolicy.targetFps}fps (usable ≥${performancePolicy.minimumUsableFps}) · inference p95 ≤${performancePolicy.maximumInferenceP95Ms}ms · pipeline p95 ≤${performancePolicy.maximumPipelineP95Ms}ms`,
+      `Renderer: ${this.shell.gameHost.dataset['rendererState'] ?? 'absent'} · ${activeRenderer.targetFps}fps · AA ${activeRenderer.antialias ? 'on' : 'off'} · ${activeRenderer.transparent ? 'transparent' : 'opaque'} · effects ${activeRenderer.effectsQuality}`,
       `Tracking: ${this.lastTrackerFrame?.players.map((player) => `${player.lane}:${player.state}`).join(' | ') ?? 'idle'}`,
       `Reliable joints: ${this.lastTrackerFrame?.players.map((player) => `${player.lane}:${player.poseQuality?.reliableLandmarkCount ?? 0}/${POSE_QUALITY_LANDMARK_COUNT}`).join(' | ') ?? 'idle'}`,
       `Ignored spectators: ${this.lastTrackerFrame?.unassignedObservations.length ?? 0}`,
@@ -2168,7 +2645,7 @@ export class AppController {
       performance.now(),
       1,
     );
-    this.game.updateTrails([...this.trailStates.values()].map(({ trail }) => trail));
+    this.game?.updateTrails([...this.trailStates.values()].map(({ trail }) => trail));
   }
 
   private readonly onKeyDown = (event: KeyboardEvent): void => {

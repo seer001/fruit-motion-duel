@@ -7,10 +7,14 @@ import type {
   PoseQualitySummary,
   TrackedPlayerPose,
 } from '../types/game';
+import { classifyDualLaneX, isInDualPlayerLane } from '../config/lanes';
 import {
   getArmObservation,
+  getHeadAnchor,
   getMultiJointPoseGeometry,
+  landmarkConfidence,
   mirrorObservation,
+  POSE_LANDMARK,
   type ArmObservation,
   type BodyDescriptor,
   type MultiJointPoseGeometry,
@@ -104,12 +108,25 @@ export interface TrackerCandidateDiagnostics {
   acceptedCandidateCount: number;
   assignedCandidateCount: number;
   rejectedCandidateCount: number;
+  /** Camera-space counts used by the two independent calibration cards. */
+  laneDiagnostics: Record<Lane, TrackerLaneCandidateDiagnostics>;
+  /** Quality-approved candidates inside the fail-closed centre safety region. */
+  centerRejectedCandidateCount: number;
+  /** Quality-approved candidates outside both player regions. */
+  outsideLaneCandidateCount: number;
   rejectionReasons: {
     invalidGeometry: number;
     lowPoseQuality: number;
     insufficientReliableLandmarks: number;
     missingUpperBodyAnchor: number;
   };
+}
+
+export interface TrackerLaneCandidateDiagnostics {
+  rawCandidateCount: number;
+  acceptedCandidateCount: number;
+  assignedCandidateCount: number;
+  ambiguousCandidateCount: number;
 }
 
 export interface TwoPlayerTrackerOptions {
@@ -160,6 +177,11 @@ interface DetectionCandidate {
 interface CandidateCollection {
   candidates: DetectionCandidate[];
   diagnostics: Omit<TrackerCandidateDiagnostics, 'assignedCandidateCount'>;
+}
+
+interface TwoPlayerAssignment {
+  assignments: [DetectionCandidate | null, DetectionCandidate | null];
+  ambiguousCandidateCounts: Record<Lane, number>;
 }
 
 interface InternalTrack {
@@ -716,11 +738,36 @@ function upperBodyStructuralConfidence(quality: PoseQualitySummary): number {
   );
 }
 
+function emptyLaneCandidateDiagnostics(): TrackerLaneCandidateDiagnostics {
+  return {
+    rawCandidateCount: 0,
+    acceptedCandidateCount: 0,
+    assignedCandidateCount: 0,
+    ambiguousCandidateCount: 0,
+  };
+}
+
+function cloneLaneDiagnostics(
+  diagnostics: Record<Lane, TrackerLaneCandidateDiagnostics>,
+): Record<Lane, TrackerLaneCandidateDiagnostics> {
+  return {
+    left: { ...diagnostics.left },
+    right: { ...diagnostics.right },
+  };
+}
+
 function createCandidates(
   observations: readonly PoseObservation[],
   options: ResolvedTrackerOptions,
+  collectDualLaneDiagnostics = false,
 ): CandidateCollection {
   const candidates: DetectionCandidate[] = [];
+  const laneDiagnostics: Record<Lane, TrackerLaneCandidateDiagnostics> = {
+    left: emptyLaneCandidateDiagnostics(),
+    right: emptyLaneCandidateDiagnostics(),
+  };
+  let centerRejectedCandidateCount = 0;
+  let outsideLaneCandidateCount = 0;
   const rejectionReasons = {
     invalidGeometry: 0,
     lowPoseQuality: 0,
@@ -729,6 +776,12 @@ function createCandidates(
   };
   observations.forEach((sourceObservation, sourceIndex) => {
     const transformed = options.mirrored ? mirrorObservation(sourceObservation) : sourceObservation;
+    if (collectDualLaneDiagnostics) {
+      const rawRegion = classifyDualLaneX(getHeadAnchor(transformed).center?.x ?? Number.NaN);
+      if (rawRegion === 'left' || rawRegion === 'right') {
+        laneDiagnostics[rawRegion].rawCandidateCount += 1;
+      }
+    }
     const geometry = getMultiJointPoseGeometry(transformed);
     if (geometry === null) {
       rejectionReasons.invalidGeometry += 1;
@@ -778,12 +831,29 @@ function createCandidates(
   // MediaPipe may return the registered players plus nearby spectators.  Keep
   // every supported model candidate here; assignment below chooses at most two.
   const keptCandidates = candidates.slice(0, 4);
+  if (collectDualLaneDiagnostics) {
+    centerRejectedCandidateCount = 0;
+    outsideLaneCandidateCount = 0;
+    for (const candidate of keptCandidates) {
+      const acceptedRegion = classifyDualLaneX(candidate.geometry.headCenter?.x ?? Number.NaN);
+      if (acceptedRegion === 'left' || acceptedRegion === 'right') {
+        laneDiagnostics[acceptedRegion].acceptedCandidateCount += 1;
+      } else if (acceptedRegion === 'center') {
+        centerRejectedCandidateCount += 1;
+      } else {
+        outsideLaneCandidateCount += 1;
+      }
+    }
+  }
   return {
     candidates: keptCandidates,
     diagnostics: {
       inputObservationCount: observations.length,
       acceptedCandidateCount: keptCandidates.length,
       rejectedCandidateCount: observations.length - keptCandidates.length,
+      laneDiagnostics,
+      centerRejectedCandidateCount,
+      outsideLaneCandidateCount,
       rejectionReasons,
     },
   };
@@ -794,6 +864,7 @@ function assignmentCost(
   candidate: DetectionCandidate,
   timestampMs: number,
   options: ResolvedTrackerOptions,
+  enforceUnlockedDualLane = false,
 ): number {
   if (
     candidate.trackletId === null ||
@@ -801,6 +872,16 @@ function assignmentCost(
     (
       track.lastCandidateTrackletId !== null &&
       candidate.trackletId !== track.lastCandidateTrackletId
+    )
+  ) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (
+    enforceUnlockedDualLane &&
+    track.identityLock === null &&
+    (
+      candidate.geometry.headCenter === null ||
+      !isInDualPlayerLane(track.binding.lane, candidate.geometry.headCenter.x)
     )
   ) {
     return Number.POSITIVE_INFINITY;
@@ -1292,6 +1373,15 @@ export class TwoPlayerTracker {
       if (track.lastCandidateTrackletId === null) {
         throw new Error(`Participant ${track.binding.participantId} has no stable head tracklet`);
       }
+      const calibratedTrackletId = profile.identityAnchor?.headTrackletId;
+      if (
+        calibratedTrackletId !== undefined &&
+        calibratedTrackletId !== track.lastCandidateTrackletId
+      ) {
+        throw new Error(
+          `Calibration head tracklet changed for ${track.binding.participantId}`,
+        );
+      }
       if (profile.lane !== track.binding.lane) {
         throw new Error(`Calibration lane does not match ${track.binding.participantId}`);
       }
@@ -1313,15 +1403,22 @@ export class TwoPlayerTracker {
         expireIdentity(track);
       }
     }
-    const candidateCollection = createCandidates(observations, this.options);
+    const candidateCollection = createCandidates(observations, this.options, true);
     const candidates = this.headTracklets.update(candidateCollection.candidates, observedAt);
-    const assignments = this.assign(candidates, observedAt);
+    const assignmentResult = this.assign(candidates, observedAt);
+    const assignments = assignmentResult.assignments;
     const assignedSourceIndices = new Set<number>();
+    const laneDiagnostics = cloneLaneDiagnostics(candidateCollection.diagnostics.laneDiagnostics);
+    laneDiagnostics.left.ambiguousCandidateCount =
+      assignmentResult.ambiguousCandidateCounts.left;
+    laneDiagnostics.right.ambiguousCandidateCount =
+      assignmentResult.ambiguousCandidateCounts.right;
     const players = this.tracks.map((track, trackIndex) => {
       const candidate = assignments[trackIndex] ?? null;
       const player = updateTrack(track, candidate, observedAt, this.options);
       if (candidate !== null && player.sourceTemporaryId !== null) {
         assignedSourceIndices.add(candidate.sourceIndex);
+        laneDiagnostics[track.binding.lane].assignedCandidateCount += 1;
       }
       return player;
     }) as [PlayerTrackingResult, PlayerTrackingResult];
@@ -1335,6 +1432,7 @@ export class TwoPlayerTracker {
       candidateDiagnostics: {
         ...candidateCollection.diagnostics,
         assignedCandidateCount: assignedSourceIndices.size,
+        laneDiagnostics,
       },
     };
   }
@@ -1342,8 +1440,11 @@ export class TwoPlayerTracker {
   private assign(
     candidates: readonly DetectionCandidate[],
     timestampMs: number,
-  ): [DetectionCandidate | null, DetectionCandidate | null] {
-    if (candidates.length === 0) return [null, null];
+  ): TwoPlayerAssignment {
+    const noAmbiguity: Record<Lane, number> = { left: 0, right: 0 };
+    if (candidates.length === 0) {
+      return { assignments: [null, null], ambiguousCandidateCounts: noAmbiguity };
+    }
 
     interface Plan {
       assignment: [DetectionCandidate | null, DetectionCandidate | null];
@@ -1376,6 +1477,7 @@ export class TwoPlayerTracker {
             candidate,
             timestampMs,
             this.options,
+            true,
           );
           if (!Number.isFinite(cost) || cost > this.options.maximumAssignmentCost) {
             valid = false;
@@ -1389,7 +1491,9 @@ export class TwoPlayerTracker {
 
     plans.sort((a, b) => a.cost - b.cost);
     const best = plans[0];
-    if (best === undefined) return [null, null];
+    if (best === undefined) {
+      return { assignments: [null, null], ambiguousCandidateCounts: noAmbiguity };
+    }
     const ambiguityMargin = this.tracks.some(({ identityLock }) => identityLock !== null)
       ? Math.max(this.options.ambiguityMargin, LOCKED_IDENTITY_AMBIGUITY_MARGIN)
       : this.options.ambiguityMargin;
@@ -1402,16 +1506,24 @@ export class TwoPlayerTracker {
     // player blink every few frames. Only a competing non-null person can make
     // an assigned identity ambiguous. If every near-optimal global plan agrees
     // on player A but not B, A keeps playing while B safely emits no blade.
-    return [0, 1].map((trackIndex) => {
+    const ambiguousCandidateCounts: Record<Lane, number> = { left: 0, right: 0 };
+    const assignments = [0, 1].map((trackIndex) => {
       const selected = best.assignment[trackIndex] ?? null;
       if (selected === null) return null;
-      const hasCompetingPerson = plausible.some(
-        (plan) =>
-          plan.assignment[trackIndex] !== null &&
-          plan.assignment[trackIndex] !== selected,
+      const competingCandidates = new Set(
+        plausible.flatMap((plan) => {
+          const candidate = plan.assignment[trackIndex] ?? null;
+          return candidate === null || candidate === selected ? [] : [candidate];
+        }),
       );
-      return hasCompetingPerson ? null : selected;
+      if (competingCandidates.size === 0) return selected;
+      const lane = this.tracks[trackIndex]?.binding.lane;
+      if (lane !== undefined) {
+        ambiguousCandidateCounts[lane] = competingCandidates.size + 1;
+      }
+      return null;
     }) as [DetectionCandidate | null, DetectionCandidate | null];
+    return { assignments, ambiguousCandidateCounts };
   }
 }
 
@@ -1445,6 +1557,15 @@ export class SinglePlayerTracker {
     );
     if (profile === undefined) {
       throw new Error(`Missing calibration profile for ${this.track.binding.participantId}`);
+    }
+    const calibratedTrackletId = profile.identityAnchor?.headTrackletId;
+    if (
+      calibratedTrackletId !== undefined &&
+      calibratedTrackletId !== this.track.lastCandidateTrackletId
+    ) {
+      throw new Error(
+        `Calibration head tracklet changed for ${this.track.binding.participantId}`,
+      );
     }
     // The one-person API intentionally matches TwoPlayerTracker so the app can
     // seal either mode without branching on the tracker implementation.
@@ -1511,45 +1632,99 @@ export interface CalibrationCollectorOptions {
   maximumSamples?: number;
   minimumConfidence?: number;
   minimumHeadConfidence?: number;
+  minimumHeadPointConfidence?: number;
+  minimumEarSpanSamples?: number;
+  maximumFallbackDeviation?: number;
 }
 
 interface CalibrationSample {
   geometry: MultiJointPoseGeometry;
   capturedAt: number;
   trackletId: number;
+  earSpan: number | null;
+}
+
+export type CalibrationIdentitySource = 'ear-span' | 'shoulder-torso-fallback';
+export type CalibrationParticipantStatus = 'collecting' | 'ready' | 'frozen';
+
+export interface CalibrationParticipantDiagnostics {
+  participantId: string;
+  lane: Lane;
+  sampleCount: number;
+  minimumSamples: number;
+  earSpanSampleCount: number;
+  minimumEarSpanSamples: number;
+  progress: number;
+  headTrackletId: number | null;
+  earSpanReady: boolean;
+  fallbackReady: boolean;
+  identitySource: CalibrationIdentitySource | null;
+  status: CalibrationParticipantStatus;
+}
+
+function medianRelativeDeviation(values: readonly number[], scaleFloor: number): number {
+  if (values.length === 0) return Number.POSITIVE_INFINITY;
+  const center = median(values);
+  return median(values.map((value) => Math.abs(value - center))) /
+    Math.max(scaleFloor, Math.abs(center));
 }
 
 export class CalibrationCollector {
   private readonly bindings = new Map<string, PlayerTrackBinding>();
   private readonly samples = new Map<string, CalibrationSample[]>();
+  private readonly finalizedProfiles = new Map<string, CalibrationProfile>();
   private readonly minimumSamples: number;
   private readonly maximumSamples: number;
   private readonly minimumConfidence: number;
   private readonly minimumHeadConfidence: number;
+  private readonly minimumHeadPointConfidence: number;
+  private readonly minimumEarSpanSamples: number;
+  private readonly maximumFallbackDeviation: number;
 
   constructor(
     bindings: readonly PlayerTrackBinding[],
     options: CalibrationCollectorOptions = {},
   ) {
-    this.minimumSamples = options.minimumSamples ?? 12;
+    this.minimumSamples = options.minimumSamples ?? 16;
     this.maximumSamples = options.maximumSamples ?? 90;
-    // Twenty-four median samples are collected by the app. A 0.50 structural
-    // gate is strict enough for scale geometry while no longer requiring the
-    // tiny hand/hip landmarks that degrade in a two-person wide shot.
-    this.minimumConfidence = options.minimumConfidence ?? 0.5;
-    // The head is the stable subject anchor. A modest threshold still supports
-    // wide two-person framing, while 24 synchronized median samples suppress
-    // single-point jitter.
+    this.minimumConfidence = options.minimumConfidence ?? 0.45;
     this.minimumHeadConfidence = options.minimumHeadConfidence ?? 0.3;
+    this.minimumHeadPointConfidence = options.minimumHeadPointConfidence ?? 0.28;
+    this.minimumEarSpanSamples = options.minimumEarSpanSamples ?? 6;
+    this.maximumFallbackDeviation = options.maximumFallbackDeviation ?? 0.18;
+    if (!Number.isInteger(this.minimumSamples) || this.minimumSamples <= 0) {
+      throw new RangeError('minimumSamples must be a positive integer');
+    }
+    if (!Number.isInteger(this.maximumSamples) || this.maximumSamples < this.minimumSamples) {
+      throw new RangeError('maximumSamples must be an integer no smaller than minimumSamples');
+    }
+    if (!Number.isInteger(this.minimumEarSpanSamples) || this.minimumEarSpanSamples <= 0) {
+      throw new RangeError('minimumEarSpanSamples must be a positive integer');
+    }
+    for (const [name, value] of [
+      ['minimumConfidence', this.minimumConfidence],
+      ['minimumHeadConfidence', this.minimumHeadConfidence],
+      ['minimumHeadPointConfidence', this.minimumHeadPointConfidence],
+    ] as const) {
+      if (!Number.isFinite(value) || value < 0 || value > 1) {
+        throw new RangeError(`${name} must be in [0, 1]`);
+      }
+    }
+    if (!Number.isFinite(this.maximumFallbackDeviation) || this.maximumFallbackDeviation < 0) {
+      throw new RangeError('maximumFallbackDeviation must be non-negative and finite');
+    }
     for (const binding of bindings) {
+      if (this.bindings.has(binding.participantId)) {
+        throw new Error(`Duplicate calibration participant ${binding.participantId}`);
+      }
       this.bindings.set(binding.participantId, { ...binding });
       this.samples.set(binding.participantId, []);
     }
   }
 
   add(frame: { observedAt: number; players: readonly PlayerTrackingResult[] }): void {
-    const additions: Array<{ participantId: string; sample: CalibrationSample }> = [];
     for (const binding of this.bindings.values()) {
+      if (this.finalizedProfiles.has(binding.participantId)) continue;
       const player = frame.players.find(
         ({ participantId }) => participantId === binding.participantId,
       );
@@ -1557,8 +1732,24 @@ export class CalibrationCollector {
         player?.state !== 'tracking' ||
         player.observation === null ||
         player.headTrackletId === null
-      ) return;
+      ) continue;
       const geometry = getMultiJointPoseGeometry(player.observation);
+      const headAnchor = getHeadAnchor(player.observation);
+      const headPointConfidences = [
+        landmarkConfidence(player.observation.landmarks[POSE_LANDMARK.nose]),
+        landmarkConfidence(player.observation.landmarks[POSE_LANDMARK.leftEar]),
+        landmarkConfidence(player.observation.landmarks[POSE_LANDMARK.rightEar]),
+      ];
+      const trustedHeadPointCount = headPointConfidences.filter(
+        (confidence) => confidence >= this.minimumHeadPointConfidence,
+      ).length;
+      const trustedEarSpan =
+        headPointConfidences[1]! >= this.minimumHeadPointConfidence &&
+        headPointConfidences[2]! >= this.minimumHeadPointConfidence &&
+        headAnchor.span !== null &&
+        headAnchor.span > 0.01
+          ? headAnchor.span
+          : null;
       const calibrationConfidence =
         geometry === null
           ? 0
@@ -1570,87 +1761,58 @@ export class CalibrationCollector {
         geometry === null ||
         calibrationConfidence < this.minimumConfidence ||
         geometry.headCenter === null ||
-        geometry.headSpan === null ||
-        geometry.headSpan <= 0.01 ||
+        trustedHeadPointCount < 2 ||
         geometry.quality.headConfidence < this.minimumHeadConfidence ||
         geometry.quality.shoulderConfidence < 0.4 ||
         geometry.shoulderWidth <= 0.02 ||
-        geometry.torsoLength <= 0.02
+        geometry.torsoLength <= 0.02 ||
+        (
+          this.bindings.size === 2 &&
+          !isInDualPlayerLane(binding.lane, geometry.headCenter.x)
+        )
       ) {
-        return;
+        continue;
       }
-      additions.push({
-        participantId: player.participantId,
-        sample: {
-          geometry,
-          capturedAt: frame.observedAt,
-          trackletId: player.headTrackletId,
-        },
-      });
-    }
-
-    // Two-player calibration advances only when both head anchors are valid in
-    // the same frame. This makes the eventual lock atomic instead of allowing
-    // a spectator to fill the unfinished side later.
-    if (additions.length !== this.bindings.size) return;
-    if (additions.length === 2) {
-      const left = additions.find(
-        ({ participantId }) => this.bindings.get(participantId)?.lane === 'left',
-      );
-      const right = additions.find(
-        ({ participantId }) => this.bindings.get(participantId)?.lane === 'right',
-      );
-      const leftHead = left?.sample.geometry.headCenter;
-      const rightHead = right?.sample.geometry.headCenter;
-      if (
-        leftHead === null || leftHead === undefined ||
-        rightHead === null || rightHead === undefined ||
-        leftHead.x >= rightHead.x ||
-        rightHead.x - leftHead.x < 0.12
-      ) {
-        return;
-      }
-    }
-
-    const discontinuous = additions.some(({ participantId, sample }) => {
-      const previous = this.samples.get(participantId)?.at(-1);
-      const currentHead = sample.geometry.headCenter;
-      const previousHead = previous?.geometry.headCenter;
-      if (
-        previous === undefined ||
-        currentHead === null ||
-        previousHead === null ||
-        previousHead === undefined
-      ) return false;
-      if (previous.trackletId !== sample.trackletId) return true;
-      const permittedJump = Math.max(
-        0.1,
-        previous.geometry.shoulderWidth * 1.7,
-        sample.geometry.shoulderWidth * 1.7,
-      );
-      return pointDistance(previousHead, currentHead) > permittedJump;
-    });
-    if (discontinuous) {
-      // Discard the whole synchronized segment. Mixing samples from two
-      // different people would create a lock that belongs to neither player.
-      this.clear();
-      return;
-    }
-
-    for (const { participantId, sample } of additions) {
-      const participantSamples = this.samples.get(participantId);
+      const participantSamples = this.samples.get(binding.participantId);
       if (participantSamples === undefined) continue;
+      const sample: CalibrationSample = {
+        geometry,
+        capturedAt: frame.observedAt,
+        trackletId: player.headTrackletId,
+        earSpan: trustedEarSpan,
+      };
+      const previous = participantSamples.at(-1);
+      const previousHead = previous?.geometry.headCenter;
+      const permittedJump = previous === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.max(
+            0.1,
+            previous.geometry.shoulderWidth * 1.7,
+            sample.geometry.shoulderWidth * 1.7,
+          );
+      const discontinuous =
+        previous !== undefined &&
+        (
+          previous.trackletId !== sample.trackletId ||
+          previousHead === null ||
+          previousHead === undefined ||
+          pointDistance(previousHead, geometry.headCenter) > permittedJump
+        );
+      if (discontinuous) participantSamples.length = 0;
       participantSamples.push(sample);
       if (participantSamples.length > this.maximumSamples) participantSamples.shift();
     }
   }
 
   progress(participantId: string): number {
+    if (this.finalizedProfiles.has(participantId)) return 1;
     const count = this.samples.get(participantId)?.length ?? 0;
     return Math.min(1, count / this.minimumSamples);
   }
 
   finalize(participantId: string): CalibrationProfile | null {
+    const frozen = this.finalizedProfiles.get(participantId);
+    if (frozen !== undefined) return frozen;
     const binding = this.bindings.get(participantId);
     const participantSamples = this.samples.get(participantId);
     if (
@@ -1660,6 +1822,9 @@ export class CalibrationCollector {
     ) {
       return null;
     }
+    const diagnostics = this.createDiagnostics(binding, participantSamples, false);
+    const identitySource = diagnostics.identitySource;
+    if (identitySource === null) return null;
     const headSamples = participantSamples
       .map((sample) => sample.geometry.headCenter)
       .filter((point): point is Point => point !== null);
@@ -1683,10 +1848,10 @@ export class CalibrationCollector {
     const torsoLength = median(
       participantSamples.map((sample) => sample.geometry.torsoLength),
     );
-    const headSpanRatios = participantSamples.flatMap(({ geometry }) =>
-      geometry.headSpan === null || geometry.shoulderWidth <= 0
+    const headSpanRatios = participantSamples.flatMap(({ geometry, earSpan }) =>
+      earSpan === null || geometry.shoulderWidth <= 0
         ? []
-        : [geometry.headSpan / geometry.shoulderWidth],
+        : [earSpan / geometry.shoulderWidth],
     );
     const hipWidth = medianOrUndefined(
       participantSamples
@@ -1694,7 +1859,26 @@ export class CalibrationCollector {
         .filter((value) => value > 0),
     );
     const upperArmLength = medianOrUndefined(armLengths);
-    return {
+    const identityAnchor = {
+      version: 1 as const,
+      headCenter,
+      headOffsetInShoulders: {
+        x: (headCenter.x - shoulderCenter.x) / shoulderWidth,
+        y: (headCenter.y - shoulderCenter.y) / shoulderWidth,
+      },
+      ...(identitySource === 'ear-span'
+        ? { headSpanToShoulderRatio: median(headSpanRatios) }
+        : {}),
+      torsoToShoulderRatio: torsoLength / shoulderWidth,
+      confidence: median(
+        participantSamples.map((sample) => sample.geometry.quality.headConfidence),
+      ),
+      sampleCount: participantSamples.length,
+      headTrackletId: participantSamples[0]!.trackletId,
+      earSpanSampleCount: diagnostics.earSpanSampleCount,
+      source: identitySource,
+    };
+    const profile: CalibrationProfile = {
       participantId,
       lane: binding.lane,
       activeHand: binding.activeHand,
@@ -1712,34 +1896,89 @@ export class CalibrationCollector {
       },
       poseQuality: median(participantSamples.map((sample) => sample.geometry.quality.score)),
       headCenter,
-      identityAnchor: {
-        version: 1,
-        headCenter,
-        headOffsetInShoulders: {
-          x: (headCenter.x - shoulderCenter.x) / shoulderWidth,
-          y: (headCenter.y - shoulderCenter.y) / shoulderWidth,
-        },
-        ...(headSpanRatios.length === 0
-          ? {}
-          : { headSpanToShoulderRatio: median(headSpanRatios) }),
-        torsoToShoulderRatio: torsoLength / shoulderWidth,
-        confidence: median(
-          participantSamples.map((sample) => sample.geometry.quality.headConfidence),
-        ),
-        sampleCount: participantSamples.length,
-      },
+      identityAnchor,
       ...(hipWidth === undefined ? {} : { hipWidth }),
       ...(upperArmLength === undefined ? {} : { upperArmLength }),
     };
+    this.finalizedProfiles.set(participantId, profile);
+    return profile;
+  }
+
+  diagnostics(participantId: string): CalibrationParticipantDiagnostics | null {
+    const binding = this.bindings.get(participantId);
+    const participantSamples = this.samples.get(participantId);
+    if (binding === undefined || participantSamples === undefined) return null;
+    return this.createDiagnostics(
+      binding,
+      participantSamples,
+      this.finalizedProfiles.has(participantId),
+    );
+  }
+
+  allDiagnostics(): CalibrationParticipantDiagnostics[] {
+    return [...this.bindings.values()].map((binding) =>
+      this.createDiagnostics(
+        binding,
+        this.samples.get(binding.participantId) ?? [],
+        this.finalizedProfiles.has(binding.participantId),
+      ),
+    );
   }
 
   clear(participantId?: string): void {
     if (participantId === undefined) {
       for (const participantSamples of this.samples.values()) participantSamples.length = 0;
+      this.finalizedProfiles.clear();
       return;
     }
     const participantSamples = this.samples.get(participantId);
     if (participantSamples !== undefined) participantSamples.length = 0;
+    this.finalizedProfiles.delete(participantId);
+  }
+
+  private createDiagnostics(
+    binding: PlayerTrackBinding,
+    participantSamples: readonly CalibrationSample[],
+    frozen: boolean,
+  ): CalibrationParticipantDiagnostics {
+    const earSpanSampleCount = participantSamples.filter(({ earSpan }) => earSpan !== null).length;
+    const enoughSamples = participantSamples.length >= this.minimumSamples;
+    const earSpanReady = enoughSamples && earSpanSampleCount >= this.minimumEarSpanSamples;
+    const headOffsetX = participantSamples.map(({ geometry }) =>
+      (geometry.headCenter!.x - geometry.shoulderCenter.x) / geometry.shoulderWidth,
+    );
+    const headOffsetY = participantSamples.map(({ geometry }) =>
+      (geometry.headCenter!.y - geometry.shoulderCenter.y) / geometry.shoulderWidth,
+    );
+    const torsoRatios = participantSamples.map(
+      ({ geometry }) => geometry.torsoLength / geometry.shoulderWidth,
+    );
+    const shoulderWidths = participantSamples.map(({ geometry }) => geometry.shoulderWidth);
+    const fallbackReady =
+      enoughSamples &&
+      medianRelativeDeviation(headOffsetX, 0.5) <= this.maximumFallbackDeviation &&
+      medianRelativeDeviation(headOffsetY, 0.5) <= this.maximumFallbackDeviation &&
+      medianRelativeDeviation(torsoRatios, 1) <= this.maximumFallbackDeviation &&
+      medianRelativeDeviation(shoulderWidths, 0.05) <= this.maximumFallbackDeviation;
+    const identitySource: CalibrationIdentitySource | null = earSpanReady
+      ? 'ear-span'
+      : fallbackReady
+        ? 'shoulder-torso-fallback'
+        : null;
+    return {
+      participantId: binding.participantId,
+      lane: binding.lane,
+      sampleCount: participantSamples.length,
+      minimumSamples: this.minimumSamples,
+      earSpanSampleCount,
+      minimumEarSpanSamples: this.minimumEarSpanSamples,
+      progress: frozen ? 1 : Math.min(1, participantSamples.length / this.minimumSamples),
+      headTrackletId: participantSamples[0]?.trackletId ?? null,
+      earSpanReady,
+      fallbackReady,
+      identitySource,
+      status: frozen ? 'frozen' : identitySource === null ? 'collecting' : 'ready',
+    };
   }
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assessCalibrationHealth,
+  assessCalibrationRecognition,
   summarizeCalibrationPerformance,
   type CalibrationHealthInput,
   type CalibrationPerformanceSnapshot,
@@ -55,6 +56,42 @@ describe('calibration diagnostics', () => {
       ...HEALTHY_INPUT,
       performance: snapshot,
     }).code).toBe('performance-insufficient');
+  });
+
+  it('uses the selected performance policy when deciding whether measurement is ready', () => {
+    const snapshot = summarizeCalibrationPerformance({
+      inferenceSamples: [58, 58, 58],
+      pipelineSamples: [110, 110, 110],
+      inferenceTimestamps: [1_000, 1_060, 1_120],
+      nowMs: 1_150,
+      backend: 'gpu',
+      minimumUsableFps: 12,
+    });
+    expect(snapshot.fps).toBeCloseTo(16.7, 1);
+    expect(snapshot.ready).toBe(false);
+  });
+
+  it('reports recognition blockers independently from poor performance', () => {
+    const recognition = assessCalibrationRecognition({
+      ...HEALTHY_INPUT,
+      rawPoseCount: 1,
+      acceptedCandidateCount: 1,
+      assignedPlayerCount: 1,
+      lockedPlayerCount: 1,
+      recognizedHandCount: 1,
+    });
+    expect(recognition.code).toBe('only-one-person');
+
+    const legacyCombined = assessCalibrationHealth({
+      ...HEALTHY_INPUT,
+      rawPoseCount: 1,
+      acceptedCandidateCount: 1,
+      assignedPlayerCount: 1,
+      lockedPlayerCount: 1,
+      recognizedHandCount: 1,
+      performance: { ...GOOD_PERFORMANCE, fps: 5 },
+    });
+    expect(legacyCombined.code).toBe('only-one-person');
   });
 
   it.each([

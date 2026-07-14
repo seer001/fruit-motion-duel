@@ -135,6 +135,14 @@ function withoutHead(observation: PoseObservation): PoseObservation {
   return observation;
 }
 
+function withoutEarSpan(observation: PoseObservation): PoseObservation {
+  const rightEar = observation.landmarks[8];
+  if (rightEar !== undefined) {
+    observation.landmarks[8] = landmark(rightEar.x, rightEar.y, 0.01);
+  }
+  return observation;
+}
+
 function calibratedHeadLockedTracker(
   options: ConstructorParameters<typeof TwoPlayerTracker>[1] = {},
 ): TwoPlayerTracker {
@@ -264,7 +272,65 @@ describe('TwoPlayerTracker', () => {
       acceptedCandidateCount: 2,
       assignedCandidateCount: 0,
       rejectedCandidateCount: 0,
+      centerRejectedCandidateCount: 2,
     });
+  });
+
+  it('acquires unlocked players only inside their own lane and reports per-side counts', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const frame = tracker.update(
+      [pose(0.5, 'center'), pose(0.75, 'blue')],
+      0,
+    );
+
+    expect(frame.players[0].sourceTemporaryId).toBeNull();
+    expect(frame.players[1].sourceTemporaryId).toBe('blue');
+    expect(frame.candidateDiagnostics).toMatchObject({
+      assignedCandidateCount: 1,
+      centerRejectedCandidateCount: 1,
+      laneDiagnostics: {
+        left: {
+          rawCandidateCount: 0,
+          acceptedCandidateCount: 0,
+          assignedCandidateCount: 0,
+          ambiguousCandidateCount: 0,
+        },
+        right: {
+          rawCandidateCount: 1,
+          acceptedCandidateCount: 1,
+          assignedCandidateCount: 1,
+          ambiguousCandidateCount: 0,
+        },
+      },
+    });
+  });
+
+  it('marks two near-equal candidates in one lane ambiguous without blocking the other lane', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const frame = tracker.update(
+      [
+        shapedPose(0.25, 'left-a', 0.1),
+        shapedPose(0.251, 'left-b', 0.1),
+        shapedPose(0.75, 'right', 0.16),
+      ],
+      0,
+    );
+
+    expect(frame.players[0].sourceTemporaryId).toBeNull();
+    expect(frame.players[1].sourceTemporaryId).toBe('right');
+    expect(frame.candidateDiagnostics.laneDiagnostics.left).toMatchObject({
+      rawCandidateCount: 2,
+      acceptedCandidateCount: 2,
+      assignedCandidateCount: 0,
+      ambiguousCandidateCount: 2,
+    });
+    expect(frame.candidateDiagnostics.laneDiagnostics.right.assignedCandidateCount).toBe(1);
   });
 
   it('mirrors all landmarks before lane assignment and wrist output', () => {
@@ -520,16 +586,27 @@ describe('TwoPlayerTracker', () => {
     });
   });
 
-  it('follows registered body proportions through a two-player lane crossing', () => {
+  it('follows atomically locked identities through a two-player lane crossing', () => {
     const tracker = new TwoPlayerTracker(bindings, {
       mirrored: false,
       acquisitionFrames: 1,
       ambiguityMargin: 0.04,
     });
-    tracker.update(
+    const collector = new CalibrationCollector(bindings, {
+      minimumSamples: 1,
+      minimumEarSpanSamples: 1,
+    });
+    const calibrationFrame = tracker.update(
       [shapedPose(0.25, 'red-start', 0.09), shapedPose(0.75, 'blue-start', 0.23)],
       0,
     );
+    collector.add(calibrationFrame);
+    const redProfile = collector.finalize('red');
+    const blueProfile = collector.finalize('blue');
+    if (redProfile === null || blueProfile === null) {
+      throw new Error('Crossing calibration fixture failed');
+    }
+    tracker.lockIdentities([redProfile, blueProfile]);
     tracker.update(
       [shapedPose(0.34, 'red-a', 0.09), shapedPose(0.66, 'blue-a', 0.23)],
       50,
@@ -839,6 +916,195 @@ describe('SinglePlayerTracker', () => {
 });
 
 describe('CalibrationCollector', () => {
+  it('never samples a centre-zone candidate while the valid side still advances', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const collector = new CalibrationCollector(bindings, { minimumSamples: 2 });
+    for (let frameIndex = 0; frameIndex < 2; frameIndex += 1) {
+      collector.add(tracker.update(
+        [pose(0.5, `center-${frameIndex}`), pose(0.75, `blue-${frameIndex}`)],
+        frameIndex * 33,
+      ));
+    }
+
+    expect(collector.progress('red')).toBe(0);
+    expect(collector.progress('blue')).toBe(1);
+    expect(collector.diagnostics('red')?.sampleCount).toBe(0);
+  });
+
+  it('advances and freezes each side independently before the pair is atomically locked', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const collector = new CalibrationCollector(bindings);
+
+    for (let frameIndex = 0; frameIndex < 16; frameIndex += 1) {
+      collector.add(tracker.update([
+        pose(0.25, `red-${frameIndex}`),
+        withoutHead(pose(0.75, `blue-hidden-${frameIndex}`)),
+      ], frameIndex * 33));
+    }
+
+    expect(collector.progress('red')).toBe(1);
+    expect(collector.progress('blue')).toBe(0);
+    const redProfile = collector.finalize('red');
+    expect(redProfile).not.toBeNull();
+    expect(collector.diagnostics('red')).toMatchObject({
+      sampleCount: 16,
+      earSpanSampleCount: 16,
+      identitySource: 'ear-span',
+      status: 'frozen',
+    });
+
+    for (let frameIndex = 16; frameIndex < 32; frameIndex += 1) {
+      collector.add(tracker.update(
+        [pose(0.75, `blue-${frameIndex}`)],
+        frameIndex * 33,
+      ));
+    }
+
+    expect(collector.diagnostics('red')?.sampleCount).toBe(16);
+    expect(collector.progress('blue')).toBe(1);
+    const blueProfile = collector.finalize('blue');
+    expect(blueProfile).not.toBeNull();
+    expect(collector.finalize('red')).toBe(redProfile);
+    if (redProfile === null || blueProfile === null) {
+      throw new Error('Independent calibration fixture failed');
+    }
+
+    tracker.lockIdentities([redProfile, blueProfile]);
+    const locked = tracker.update(
+      [pose(0.25, 'red-locked'), pose(0.75, 'blue-locked')],
+      32 * 33,
+    );
+    expect(locked.players.every(({ identity }) => identity.locked)).toBe(true);
+  });
+
+  it('clears only the side whose head tracklet changes', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const collector = new CalibrationCollector(bindings, {
+      minimumSamples: 3,
+      minimumEarSpanSamples: 2,
+    });
+    for (let frameIndex = 0; frameIndex < 2; frameIndex += 1) {
+      collector.add(tracker.update(
+        [pose(0.25, `red-${frameIndex}`), pose(0.75, `blue-${frameIndex}`)],
+        frameIndex * 33,
+      ));
+    }
+    const changed = tracker.update(
+      [pose(0.25, 'red-stable'), pose(0.75, 'blue-replaced')],
+      66,
+    );
+    const blue = changed.players[1];
+    if (blue.headTrackletId === null) throw new Error('Blue tracklet fixture missing');
+    collector.add({
+      observedAt: changed.observedAt,
+      players: [changed.players[0], { ...blue, headTrackletId: blue.headTrackletId + 100 }],
+    });
+
+    expect(collector.diagnostics('red')).toMatchObject({ sampleCount: 3, status: 'ready' });
+    expect(collector.diagnostics('blue')).toMatchObject({ sampleCount: 1, status: 'collecting' });
+  });
+
+  it('uses six ear spans when available without requiring ears in every sample', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const collector = new CalibrationCollector(bindings);
+    for (let frameIndex = 0; frameIndex < 16; frameIndex += 1) {
+      const red = pose(0.25, `red-${frameIndex}`);
+      const blue = pose(0.75, `blue-${frameIndex}`);
+      if (frameIndex >= 6) {
+        withoutEarSpan(red);
+        withoutEarSpan(blue);
+      }
+      collector.add(tracker.update([red, blue], frameIndex * 33));
+    }
+
+    expect(collector.diagnostics('red')).toMatchObject({
+      sampleCount: 16,
+      earSpanSampleCount: 6,
+      earSpanReady: true,
+      identitySource: 'ear-span',
+      status: 'ready',
+    });
+    expect(collector.finalize('red')?.identityAnchor?.headSpanToShoulderRatio).toBeGreaterThan(0);
+  });
+
+  it('uses an explicit stable shoulder and torso fallback when no ear span is available', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const collector = new CalibrationCollector(bindings);
+    for (let frameIndex = 0; frameIndex < 16; frameIndex += 1) {
+      collector.add(tracker.update([
+        withoutEarSpan(pose(0.25, `red-${frameIndex}`)),
+        withoutEarSpan(pose(0.75, `blue-${frameIndex}`)),
+      ], frameIndex * 33));
+    }
+
+    expect(collector.diagnostics('red')).toMatchObject({
+      sampleCount: 16,
+      earSpanSampleCount: 0,
+      earSpanReady: false,
+      fallbackReady: true,
+      identitySource: 'shoulder-torso-fallback',
+      status: 'ready',
+    });
+    const profile = collector.finalize('red');
+    expect(profile).not.toBeNull();
+    expect(profile?.identityAnchor?.headSpanToShoulderRatio).toBeUndefined();
+    expect(profile?.identityAnchor).toMatchObject({
+      sampleCount: 16,
+      earSpanSampleCount: 0,
+      source: 'shoulder-torso-fallback',
+    });
+  });
+
+  it('does not finalize an unstable shoulder and torso fallback', () => {
+    const tracker = new TwoPlayerTracker(bindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    const seed = tracker.update([pose(0.25, 'red-seed'), pose(0.75, 'blue-seed')], 0);
+    const collector = new CalibrationCollector(bindings);
+    const redSeed = seed.players[0];
+    if (redSeed.headTrackletId === null) throw new Error('Red tracklet fixture missing');
+
+    for (let frameIndex = 0; frameIndex < 16; frameIndex += 1) {
+      const observation = withoutEarSpan(
+        shapedPose(0.25, `red-unstable-${frameIndex}`, frameIndex % 2 === 0 ? 0.05 : 0.2),
+      );
+      collector.add({
+        observedAt: frameIndex * 33,
+        players: [{
+          ...redSeed,
+          sourceTemporaryId: observation.temporaryId,
+          observation,
+          headTrackletId: redSeed.headTrackletId,
+        }],
+      });
+    }
+
+    expect(collector.diagnostics('red')).toMatchObject({
+      sampleCount: 16,
+      earSpanSampleCount: 0,
+      fallbackReady: false,
+      identitySource: null,
+      status: 'collecting',
+    });
+    expect(collector.finalize('red')).toBeNull();
+  });
+
   it('does not advance or finalize without a reliable head anchor', () => {
     const tracker = new TwoPlayerTracker(bindings, {
       mirrored: false,

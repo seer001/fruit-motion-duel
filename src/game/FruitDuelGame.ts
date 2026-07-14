@@ -31,6 +31,107 @@ const BLADE_CURSOR_HALO_RADIUS = 48;
 const TRAIL_VISIBLE_MS = 180;
 const SCORING_RESULT_FRESHNESS_MS = 180;
 
+export type FruitDuelEffectsQuality = 'off' | 'low' | 'medium' | 'high';
+
+export interface FruitDuelRenderSettings {
+  targetFps: 30 | 45 | 60;
+  antialias: boolean;
+  transparent: boolean;
+  effectsQuality: FruitDuelEffectsQuality;
+}
+
+export interface FruitDuelEffectProfile {
+  sliceParticleCount: number;
+  cameraShakeDurationMs: number;
+  cameraShakeIntensity: number;
+  showSlicePopup: boolean;
+  showMultiSliceBadge: boolean;
+  trailStyle: 'simple' | 'full';
+}
+
+export const FRUIT_DUEL_EFFECT_PROFILES = Object.freeze({
+  off: Object.freeze({
+    sliceParticleCount: 0,
+    cameraShakeDurationMs: 0,
+    cameraShakeIntensity: 0,
+    showSlicePopup: false,
+    showMultiSliceBadge: false,
+    trailStyle: 'simple',
+  }),
+  low: Object.freeze({
+    sliceParticleCount: 4,
+    cameraShakeDurationMs: 180,
+    cameraShakeIntensity: 0.004,
+    showSlicePopup: false,
+    showMultiSliceBadge: false,
+    trailStyle: 'simple',
+  }),
+  medium: Object.freeze({
+    sliceParticleCount: 7,
+    cameraShakeDurationMs: 220,
+    cameraShakeIntensity: 0.006,
+    showSlicePopup: true,
+    showMultiSliceBadge: true,
+    trailStyle: 'full',
+  }),
+  high: Object.freeze({
+    sliceParticleCount: 10,
+    cameraShakeDurationMs: 250,
+    cameraShakeIntensity: 0.009,
+    showSlicePopup: true,
+    showMultiSliceBadge: true,
+    trailStyle: 'full',
+  }),
+} satisfies Record<FruitDuelEffectsQuality, FruitDuelEffectProfile>);
+
+export const DEFAULT_FRUIT_DUEL_RENDER_SETTINGS: Readonly<FruitDuelRenderSettings> = Object.freeze({
+  targetFps: 60,
+  antialias: true,
+  transparent: true,
+  effectsQuality: 'high',
+});
+
+export interface FruitDuelRendererConfig {
+  targetFps: 30 | 45 | 60;
+  antialias: boolean;
+  transparent: boolean;
+  backgroundColor: string;
+  fps: {
+    target: 30 | 45 | 60;
+    limit: 30 | 45 | 60;
+    smoothStep: true;
+  };
+}
+
+/**
+ * Produces the initialization-only renderer values without touching Phaser.
+ * Keeping this pure makes it possible to characterize renderer rebuilds in
+ * unit tests without creating a WebGL context.
+ */
+export function createFruitDuelRendererConfig(
+  settings: FruitDuelRenderSettings,
+): FruitDuelRendererConfig {
+  return {
+    targetFps: settings.targetFps,
+    antialias: settings.antialias,
+    transparent: settings.transparent,
+    backgroundColor: settings.transparent ? 'rgba(0,0,0,0)' : '#07111f',
+    fps: {
+      target: settings.targetFps,
+      // Phaser's `target` is a timing target only. `limit` is what actually
+      // prevents update/render work from running at the display refresh rate.
+      limit: settings.targetFps,
+      smoothStep: true,
+    },
+  };
+}
+
+export function getFruitDuelEffectProfile(
+  quality: FruitDuelEffectsQuality,
+): Readonly<FruitDuelEffectProfile> {
+  return FRUIT_DUEL_EFFECT_PROFILES[quality];
+}
+
 interface ActiveTarget {
   eventId: string;
   ownerId: string;
@@ -58,7 +159,14 @@ type GameBusEvent =
   | 'round-pause'
   | 'round-resume'
   | 'round-abort'
+  | 'effects-quality'
   | 'trails';
+
+function isFruitDuelRenderSettings(
+  value: FruitDuelRenderSettings | FruitDuelCallbacks,
+): value is FruitDuelRenderSettings {
+  return 'targetFps' in value;
+}
 
 export class FruitDuelGame {
   readonly ready: Promise<void>;
@@ -66,23 +174,54 @@ export class FruitDuelGame {
   private readonly bus = new Phaser.Events.EventEmitter();
   private readonly game: Phaser.Game;
   private resolveReady!: () => void;
+  private sceneReady = false;
+  private sleepRequested = false;
+  private destroyed = false;
+  private renderSettings: FruitDuelRenderSettings;
 
-  constructor(parent: HTMLElement, audio: AudioManager, callbacks: FruitDuelCallbacks = {}) {
+  constructor(parent: HTMLElement, audio: AudioManager, callbacks?: FruitDuelCallbacks);
+  constructor(
+    parent: HTMLElement,
+    audio: AudioManager,
+    renderSettings: FruitDuelRenderSettings,
+    callbacks?: FruitDuelCallbacks,
+  );
+  constructor(
+    parent: HTMLElement,
+    audio: AudioManager,
+    settingsOrCallbacks: FruitDuelRenderSettings | FruitDuelCallbacks = DEFAULT_FRUIT_DUEL_RENDER_SETTINGS,
+    configuredCallbacks: FruitDuelCallbacks = {},
+  ) {
     this.ready = new Promise<void>((resolve) => {
       this.resolveReady = resolve;
     });
 
-    const scene = new DuelScene(this.bus, audio, callbacks);
+    const hasRenderSettings = isFruitDuelRenderSettings(settingsOrCallbacks);
+    const renderSettings = hasRenderSettings
+      ? settingsOrCallbacks
+      : DEFAULT_FRUIT_DUEL_RENDER_SETTINGS;
+    this.renderSettings = { ...renderSettings };
+    const callbacks = hasRenderSettings ? configuredCallbacks : settingsOrCallbacks;
+    const rendererConfig = createFruitDuelRendererConfig(renderSettings);
+    const effectsProfile = getFruitDuelEffectProfile(renderSettings.effectsQuality);
+    const scene = new DuelScene(this.bus, audio, callbacks, effectsProfile);
+
+    // Register before constructing Phaser so a future synchronous boot path
+    // cannot emit `scene-ready` before the readiness promise has a listener.
+    this.bus.once('scene-ready', () => {
+      this.sceneReady = true;
+      this.resolveReady();
+    });
     this.game = new Phaser.Game({
       type: Phaser.WEBGL,
       parent,
       width: LOGICAL_WIDTH,
       height: LOGICAL_HEIGHT,
-      transparent: true,
-      backgroundColor: 'rgba(0,0,0,0)',
-      antialias: true,
+      transparent: rendererConfig.transparent,
+      backgroundColor: rendererConfig.backgroundColor,
+      antialias: rendererConfig.antialias,
       render: {
-        antialias: true,
+        antialias: rendererConfig.antialias,
         pixelArt: false,
         roundPixels: false,
         powerPreference: 'high-performance',
@@ -92,43 +231,109 @@ export class FruitDuelGame {
         autoCenter: Phaser.Scale.CENTER_BOTH,
       },
       fps: {
-        target: 60,
-        smoothStep: true,
+        ...rendererConfig.fps,
       },
       scene: [scene],
       audio: {
         noAudio: true,
       },
     });
-
-    this.bus.once('scene-ready', () => this.resolveReady());
   }
 
   async prepareRound(config: GameRoundConfig, countdownSeconds = 3): Promise<void> {
     await this.ready;
+    if (this.destroyed) return;
+    this.wake();
     this.bus.emit('round-prepare', config);
     this.bus.emit('round-countdown', countdownSeconds);
   }
 
   updateTrails(trails: SliceTrail[]): void {
+    if (this.destroyed) return;
     this.bus.emit('trails', trails);
   }
 
   pause(reason = '主持人暫停'): void {
+    if (this.destroyed) return;
     this.bus.emit('round-pause', reason);
   }
 
   resume(): void {
+    if (this.destroyed) return;
     this.bus.emit('round-resume');
   }
 
   abort(): void {
+    if (this.destroyed) return;
     this.bus.emit('round-abort');
   }
 
+  get currentRenderSettings(): FruitDuelRenderSettings {
+    return { ...this.renderSettings };
+  }
+
+  /** Updates Phaser's FPS limiter without rebuilding WebGL or round state. */
+  setTargetFps(targetFps: FruitDuelRenderSettings['targetFps']): void {
+    if (this.destroyed || this.renderSettings.targetFps === targetFps) return;
+    this.renderSettings = { ...this.renderSettings, targetFps };
+    const loop = this.game.loop as Phaser.Core.TimeStep & {
+      _limitRate: number;
+      _target: number;
+    };
+    const wasRunning = loop.running;
+    if (wasRunning) loop.sleep();
+    loop.targetFps = targetFps;
+    loop.fpsLimit = targetFps;
+    loop.hasFpsLimit = true;
+    loop._limitRate = 1_000 / targetFps;
+    loop._target = 1_000 / targetFps;
+    if (wasRunning) loop.wake();
+  }
+
+  /** Effects are scene data, so Auto may change them without rebuilding WebGL. */
+  setEffectsQuality(effectsQuality: FruitDuelEffectsQuality): void {
+    if (this.destroyed || this.renderSettings.effectsQuality === effectsQuality) return;
+    this.renderSettings = { ...this.renderSettings, effectsQuality };
+    const apply = (): void => {
+      if (!this.destroyed) this.bus.emit('effects-quality', effectsQuality);
+    };
+    if (this.sceneReady) apply();
+    else void this.ready.then(apply);
+  }
+
+  /** Stops Phaser's global TimeStep, including its requestAnimationFrame. */
+  sleep(): void {
+    if (this.destroyed || this.sleepRequested) return;
+    this.sleepRequested = true;
+    if (this.sceneReady) {
+      this.game.loop.sleep();
+      return;
+    }
+    void this.ready.then(() => {
+      if (!this.destroyed && this.sleepRequested) this.game.loop.sleep();
+    });
+  }
+
+  /** Restarts Phaser's global TimeStep after an application-level sleep. */
+  wake(): void {
+    if (this.destroyed) return;
+    this.sleepRequested = false;
+    if (this.sceneReady && !this.game.loop.running) this.game.loop.wake();
+  }
+
   destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.sleepRequested = false;
     this.bus.removeAllListeners();
+    // Resolving makes an in-flight prepareRound leave through its destroyed
+    // guard even if Phaser is torn down before the Scene reaches create().
+    this.resolveReady();
     this.game.destroy(true);
+    // Phaser defers destruction until its next game step. A renderer that was
+    // sleeping has no next RAF, so wake it once; wake() immediately ticks and
+    // consumes pendingDestroy, then TimeStep destruction cancels that RAF.
+    if (this.game.loop.started && !this.game.loop.running) this.game.loop.wake();
   }
 }
 
@@ -136,6 +341,7 @@ class DuelScene extends Phaser.Scene {
   private readonly bus: Phaser.Events.EventEmitter;
   private readonly audioManager: AudioManager;
   private readonly callbacks: FruitDuelCallbacks;
+  private effects: Readonly<FruitDuelEffectProfile>;
   private round: GameRoundConfig | null = null;
   private scores = new Map<string, ScoreEngine>();
   private activeTargets: ActiveTarget[] = [];
@@ -148,15 +354,22 @@ class DuelScene extends Phaser.Scene {
   private roundPaused = false;
   private lastTickBucket = -1;
   private trailGraphics!: Phaser.GameObjects.Graphics;
+  private trailGraphicsDirty = false;
   private backdropGraphics!: Phaser.GameObjects.Graphics;
   private centerMessage!: Phaser.GameObjects.Text;
   private countdownTimers: Phaser.Time.TimerEvent[] = [];
 
-  constructor(bus: Phaser.Events.EventEmitter, audio: AudioManager, callbacks: FruitDuelCallbacks) {
+  constructor(
+    bus: Phaser.Events.EventEmitter,
+    audio: AudioManager,
+    callbacks: FruitDuelCallbacks,
+    effects: Readonly<FruitDuelEffectProfile>,
+  ) {
     super({ key: 'DuelScene', active: true });
     this.bus = bus;
     this.audioManager = audio;
     this.callbacks = callbacks;
+    this.effects = effects;
   }
 
   create(): void {
@@ -182,6 +395,9 @@ class DuelScene extends Phaser.Scene {
     this.bus.on('round-pause', this.pauseRound, this);
     this.bus.on('round-resume', this.resumeRound, this);
     this.bus.on('round-abort', this.abortRound, this);
+    this.bus.on('effects-quality', (quality: FruitDuelEffectsQuality) => {
+      this.effects = getFruitDuelEffectProfile(quality);
+    });
     this.bus.on('trails', (trails: SliceTrail[]) => {
       if (!this.round) {
         this.trails = [];
@@ -213,7 +429,17 @@ class DuelScene extends Phaser.Scene {
   }
 
   update(_time: number, delta: number): void {
-    this.drawTrails();
+    const now = performance.now();
+    if (this.isIdle(now)) {
+      // The final visible trail frame must be cleared once before entering the
+      // zero-work path, otherwise it would remain frozen on the canvas.
+      if (this.trailGraphicsDirty) {
+        this.trailGraphics.clear();
+        this.trailGraphicsDirty = false;
+      }
+      return;
+    }
+    this.drawTrails(now);
     if (!this.running || this.roundPaused || !this.round) return;
 
     this.elapsedMs = Math.min(this.round.durationMs, this.elapsedMs + Math.min(delta, 50));
@@ -231,6 +457,19 @@ class DuelScene extends Phaser.Scene {
     if (this.elapsedMs >= this.round.durationMs) {
       this.finishRound();
     }
+  }
+
+  private isIdle(now: number): boolean {
+    if (this.running || this.activeTargets.length > 0 || this.hasVisibleTrails(now)) return false;
+    return this.tweens.getTweens().length === 0;
+  }
+
+  private hasVisibleTrails(now: number): boolean {
+    return this.trails.some((trail) => {
+      const receivedAt = trail.receivedAtMs ?? trail.points.at(-1)?.timestampMs ?? now;
+      const age = now - receivedAt;
+      return age >= 0 && age <= TRAIL_VISIBLE_MS;
+    });
   }
 
   private drawArena(solo = false): void {
@@ -471,7 +710,7 @@ class DuelScene extends Phaser.Scene {
     if (fruitSlices >= 2) {
       // Multi-slice is intentionally cosmetic: it never changes the score.
       this.audioManager.play('combo');
-      this.showMultiSliceBadge(fruitSlices);
+      if (this.effects.showMultiSliceBadge) this.showMultiSliceBadge(fruitSlices);
       this.callbacks.onNotice?.(`${fruitSlices} 果連切！`, 'combo');
     }
   }
@@ -488,7 +727,12 @@ class DuelScene extends Phaser.Scene {
     const pan = target.visual.x < LOGICAL_WIDTH / 2 ? -0.65 : 0.65;
     if (target.descriptor.kind === 'bomb') {
       this.audioManager.play('bomb', pan);
-      this.cameras.main.shake(250, 0.009);
+      if (this.effects.cameraShakeIntensity > 0 && this.effects.cameraShakeDurationMs > 0) {
+        this.cameras.main.shake(
+          this.effects.cameraShakeDurationMs,
+          this.effects.cameraShakeIntensity,
+        );
+      }
       this.flashTarget(target, 0xff315d);
       this.callbacks.onNotice?.('炸彈！連擊歸零', 'bomb');
     } else {
@@ -516,22 +760,25 @@ class DuelScene extends Phaser.Scene {
   }
 
   private sliceBurst(target: ActiveTarget): void {
-    const color = target.body.fillColor;
-    for (let index = 0; index < 10; index += 1) {
-      const drop = this.add.circle(target.visual.x, target.visual.y, Phaser.Math.Between(5, 13), color, 0.85).setDepth(25);
-      const angle = Phaser.Math.FloatBetween(0, Math.PI * 2);
-      const distance = Phaser.Math.Between(55, 150);
-      this.tweens.add({
-        targets: drop,
-        x: drop.x + Math.cos(angle) * distance,
-        y: drop.y + Math.sin(angle) * distance + 60,
-        alpha: 0,
-        scale: 0.2,
-        duration: Phaser.Math.Between(340, 620),
-        ease: 'Cubic.Out',
-        onComplete: () => drop.destroy(),
-      });
+    if (this.effects.sliceParticleCount > 0) {
+      const color = target.body.fillColor;
+      for (let index = 0; index < this.effects.sliceParticleCount; index += 1) {
+        const drop = this.add.circle(target.visual.x, target.visual.y, Phaser.Math.Between(5, 13), color, 0.85).setDepth(25);
+        const angle = Phaser.Math.FloatBetween(0, Math.PI * 2);
+        const distance = Phaser.Math.Between(55, 150);
+        this.tweens.add({
+          targets: drop,
+          x: drop.x + Math.cos(angle) * distance,
+          y: drop.y + Math.sin(angle) * distance + 60,
+          alpha: 0,
+          scale: 0.2,
+          duration: Phaser.Math.Between(340, 620),
+          ease: 'Cubic.Out',
+          onComplete: () => drop.destroy(),
+        });
+      }
     }
+    if (!this.effects.showSlicePopup) return;
     const popup = this.add.text(target.visual.x, target.visual.y - target.radius, 'SLICE!', {
       color: '#ffffff',
       fontFamily: 'system-ui, sans-serif',
@@ -586,14 +833,14 @@ class DuelScene extends Phaser.Scene {
     });
   }
 
-  private drawTrails(): void {
+  private drawTrails(now: number): void {
     this.trailGraphics.clear();
-    const now = performance.now();
+    this.trailGraphicsDirty = false;
     this.trails.forEach((trail) => {
-      const deliveryAgeMs = now - (trail.receivedAtMs ?? now);
-      if (deliveryAgeMs < 0 || deliveryAgeMs > TRAIL_VISIBLE_MS) return;
       const newestCaptureAt = trail.points.at(-1)?.timestampMs;
       if (newestCaptureAt === undefined) return;
+      const deliveryAgeMs = now - (trail.receivedAtMs ?? newestCaptureAt);
+      if (deliveryAgeMs < 0 || deliveryAgeMs > TRAIL_VISIBLE_MS) return;
       // Capture timestamps define the shape and speed of the sweep. Delivery
       // age defines whether it is still visible; mixing these two clocks made
       // a delayed dual-player result disappear immediately on arrival.
@@ -601,6 +848,7 @@ class DuelScene extends Phaser.Scene {
         (point) => newestCaptureAt - point.timestampMs <= TRAIL_VISIBLE_MS,
       );
       if (points.length === 0) return;
+      this.trailGraphicsDirty = true;
       const color = this.round?.players.length === 1
         ? 0xc0a9ff
         : trail.lane === 'left'
@@ -616,16 +864,36 @@ class DuelScene extends Phaser.Scene {
           0,
           1,
         );
-        this.trailGraphics.lineStyle(22 * (1 - ageRatio * 0.55), color, (1 - ageRatio) * trail.confidence);
+        if (this.effects.trailStyle === 'simple') {
+          this.trailGraphics.lineStyle(
+            15 * (1 - ageRatio * 0.4),
+            color,
+            (1 - ageRatio) * trail.confidence,
+          );
+        } else {
+          this.trailGraphics.lineStyle(22 * (1 - ageRatio * 0.55), color, (1 - ageRatio) * trail.confidence);
+        }
         this.trailGraphics.lineBetween(start.x, start.y, end.x, end.y);
-        this.trailGraphics.lineStyle(6, 0xffffff, (1 - ageRatio) * 0.9);
-        this.trailGraphics.lineBetween(start.x, start.y, end.x, end.y);
+        if (this.effects.trailStyle === 'full') {
+          this.trailGraphics.lineStyle(6, 0xffffff, (1 - ageRatio) * 0.9);
+          this.trailGraphics.lineBetween(start.x, start.y, end.x, end.y);
+        }
       }
 
       const blade = points.at(-1);
       if (!blade) return;
       const ageRatio = Phaser.Math.Clamp(deliveryAgeMs / TRAIL_VISIBLE_MS, 0, 1);
       const alpha = (1 - ageRatio * 0.55) * Math.max(0.72, trail.confidence);
+
+      if (this.effects.trailStyle === 'simple') {
+        this.trailGraphics.fillStyle(color, alpha * 0.72);
+        this.trailGraphics.fillCircle(blade.x, blade.y, BLADE_CURSOR_RADIUS - 7);
+        this.trailGraphics.lineStyle(4, 0xffffff, alpha * 0.9);
+        this.trailGraphics.strokeCircle(blade.x, blade.y, BLADE_CURSOR_RADIUS - 7);
+        this.trailGraphics.fillStyle(0xffffff, alpha);
+        this.trailGraphics.fillCircle(blade.x, blade.y, 6);
+        return;
+      }
 
       // A dark halo, white rim, player-colour ring and white center remain
       // visible on both bright clothing and a dark camera background. The

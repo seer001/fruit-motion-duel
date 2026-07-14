@@ -1,0 +1,55 @@
+# 作業系統與編輯器產生的檔案
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.code-workspace
+
+# Node.js / npm / Vite 依賴與建置產物
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# 測試與報告輸出（可能含本機路徑、trace 或截圖）
+playwright-report/
+test-results/
+playwright/.cache/
+
+# 除錯與套件管理器暫存檔
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+
+# 環境設定與機密：只提交明確命名的範例檔
+.env
+.env.*
+!.env.example
+*.local
+
+# 憑證、私鑰與本機資料庫
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# 可能含個資或現場資料的本機輸出
+recordings/
+captures/
+screenshots/
+private/
+secrets/
+*.bak
+*.tmp
+*.swp

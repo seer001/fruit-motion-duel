@@ -120,6 +120,28 @@ export function normalizeBodyPoint(
 }
 
 /**
+ * Uses the configured hand's shoulder as the horizontal neutral point while
+ * preserving the shared shoulder-relative vertical mapping. A torso-centred
+ * horizontal origin forced a right hand past the opposite shoulder to reach
+ * left-side fruit (and vice versa), exactly where pose landmarks are most
+ * likely to be occluded or swap sides.
+ */
+export function normalizeActiveHandPoint(
+  point: Point,
+  profile: CalibrationProfile,
+  anchors: BodyAnchors = profile,
+): Point {
+  const bodyPoint = normalizeBodyPoint(point, profile, anchors);
+  const activeShoulderOffset = profile.activeHand === 'right' ? 0.5 : -0.5;
+  return {
+    x:
+      (point.x - anchors.shoulderCenter.x) / profile.shoulderWidth -
+      activeShoulderOffset,
+    y: bodyPoint.y,
+  };
+}
+
+/**
  * Maps a hand's shoulder-relative height into the shared vertical playfield.
  *
  * One torso length above and below the shoulders spans the complete safe
@@ -186,7 +208,11 @@ export function mapCalibratedPointToLane(
   anchors: BodyAnchors = profile,
   options: LaneMappingOptions = {},
 ): Point {
-  return mapBodyPointToLane(normalizeBodyPoint(point, profile, anchors), profile.lane, options);
+  return mapBodyPointToLane(
+    normalizeActiveHandPoint(point, profile, anchors),
+    profile.lane,
+    options,
+  );
 }
 
 /** Maps a calibrated hand into the single-player full-width arena. */
@@ -216,5 +242,5 @@ export function mapCalibratedPointToArena(
   anchors: BodyAnchors = profile,
   options: ArenaMappingOptions = {},
 ): Point {
-  return mapBodyPointToArena(normalizeBodyPoint(point, profile, anchors), options);
+  return mapBodyPointToArena(normalizeActiveHandPoint(point, profile, anchors), options);
 }

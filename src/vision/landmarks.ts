@@ -96,8 +96,9 @@ export interface ArmObservation {
   shoulder: LandmarkObservation;
   elbow: LandmarkObservation;
   wrist: WristObservation;
+  /** Most-distal directly observed hand endpoint after multi-point validation. */
   hand: LandmarkObservation & { reliableLandmarkCount: number };
-  /** Directly observed wrist, or a directly observed multi-point hand center. */
+  /** Directly observed wrist, or the validated directly observed distal endpoint. */
   bladePoint: Point | null;
   /** Confidence of the whole shoulder-elbow-wrist chain. */
   confidence: number;
@@ -173,18 +174,54 @@ function median(values: readonly number[]): number {
   return ((ordered[middle - 1] ?? upper) + upper) / 2;
 }
 
+type VisibleLandmarkObservation = LandmarkObservation & { point: Point };
+
 /**
- * A coordinate-wise median keeps a single jumping wrist/finger landmark from
- * dragging the blade away from the directly observed hand cluster. Unlike an
- * extrapolated palm, every coordinate here comes only from visible landmarks.
+ * Selects one coordinate that MediaPipe actually returned: the coherent hand
+ * endpoint farthest from the arm. The closest coherent pair rejects a single
+ * jumping endpoint before distance ranking, so this never invents a palm
+ * centre or extrapolates a fingertip/tool beyond an observed landmark.
  */
-function robustDirectCenter(observations: readonly LandmarkObservation[]): Point | null {
-  const points = observations.flatMap(({ point }) => (point === null ? [] : [point]));
-  if (points.length === 0) return null;
-  return {
-    x: median(points.map(({ x }) => x)),
-    y: median(points.map(({ y }) => y)),
-  };
+function selectObservedDistalHandPoint(
+  observations: readonly LandmarkObservation[],
+  proximalPoint: Point | null,
+  maximumClusterSpan: number,
+): VisibleLandmarkObservation | null {
+  const visible = observations.filter(
+    (observation): observation is VisibleLandmarkObservation => observation.point !== null,
+  );
+  if (visible.length === 0) return null;
+
+  const pairs: Array<{
+    first: VisibleLandmarkObservation;
+    second: VisibleLandmarkObservation;
+    separation: number;
+  }> = [];
+  visible.forEach((first, firstIndex) => {
+    visible.slice(firstIndex + 1).forEach((second) => {
+      pairs.push({ first, second, separation: distance(first.point, second.point) });
+    });
+  });
+
+  let coherent = visible;
+  if (pairs.some(({ separation }) => separation > maximumClusterSpan)) {
+    const closestPair = [...pairs].sort((left, right) => left.separation - right.separation)[0];
+    if (!closestPair || closestPair.separation > maximumClusterSpan) return null;
+    coherent = [closestPair.first, closestPair.second];
+  }
+
+  return coherent.reduce<VisibleLandmarkObservation | null>((selected, candidate) => {
+    if (selected === null) return candidate;
+    if (proximalPoint === null) {
+      return candidate.confidence > selected.confidence ? candidate : selected;
+    }
+    const candidateDistance = distance(proximalPoint, candidate.point);
+    const selectedDistance = distance(proximalPoint, selected.point);
+    if (candidateDistance !== selectedDistance) {
+      return candidateDistance > selectedDistance ? candidate : selected;
+    }
+    return candidate.confidence > selected.confidence ? candidate : selected;
+  }, null);
 }
 
 function regionConfidence(
@@ -492,35 +529,65 @@ export function getArmObservation(
       (rawWrist.confidence >= supportedMinimum &&
         armSupport >= MINIMUM_ARM_SUPPORT_FOR_HAND));
   const wrist = wristAccepted ? rawWrist : { point: null, confidence: rawWrist.confidence };
-  const handAccepted =
-    reliableHandLandmarks >= 2 && armSupport >= MINIMUM_ARM_SUPPORT_FOR_HAND;
-  const handPoint = handAccepted ? robustDirectCenter(reliableHandObservations) : null;
   const upperArmLength =
     shoulder.point === null || elbow.point === null
       ? null
       : distance(shoulder.point, elbow.point);
+  const proximalPoint =
+    elbow.point !== null && elbow.confidence >= STRUCTURAL_MINIMUM_CONFIDENCE
+      ? elbow.point
+      : shoulder.point !== null && shoulder.confidence >= STRUCTURAL_MINIMUM_CONFIDENCE
+        ? shoulder.point
+        : wrist.point;
+  const maximumHandClusterSpan = Math.max(
+    0.04,
+    Math.min(0.11, (upperArmLength ?? 0.12) * 0.8),
+  );
+  const observedDistalHand = selectObservedDistalHandPoint(
+    reliableHandObservations,
+    proximalPoint,
+    maximumHandClusterSpan,
+  );
+  // When a dominant hand reaches inward across the torso, its elbow and wrist
+  // are commonly occluded before the three labelled hand endpoints disappear.
+  // A complete current-frame hand cluster plus a reliable same-side shoulder
+  // is enough evidence to keep that real hand available; two-point clusters
+  // still require the full shoulder/elbow support used everywhere else.
+  const completeHandClusterSupportedByShoulder =
+    reliableHandLandmarks === directHandObservations.length &&
+    shoulder.confidence >= RELIABLE_LANDMARK_CONFIDENCE;
+  const observedDistalHandNearWrist =
+    observedDistalHand !== null &&
+    wrist.point !== null &&
+    distance(observedDistalHand.point, wrist.point) <=
+      Math.max(0.045, Math.min(0.12, (upperArmLength ?? 0.12) * 0.85));
+  const singleEndpointSupportedByWrist =
+    reliableHandLandmarks === 1 &&
+    observedDistalHandNearWrist &&
+    armSupport >= MINIMUM_ARM_SUPPORT_FOR_HAND;
+  const handAccepted =
+    observedDistalHand !== null &&
+    (singleEndpointSupportedByWrist ||
+      (reliableHandLandmarks >= 2 &&
+        (armSupport >= MINIMUM_ARM_SUPPORT_FOR_HAND || completeHandClusterSupportedByShoulder)));
+  const handPoint = handAccepted ? observedDistalHand.point : null;
   const handNearWrist =
-    handPoint !== null && wrist.point !== null
-      ? distance(handPoint, wrist.point) <=
-        Math.max(0.045, Math.min(0.12, (upperArmLength ?? 0.12) * 0.85))
-      : false;
+    handPoint !== null && observedDistalHandNearWrist;
   const handDistalToElbow =
     handPoint !== null && elbow.point !== null && upperArmLength !== null
       ? distance(handPoint, elbow.point) >=
           Math.max(0.025, Math.min(0.07, upperArmLength * 0.35)) &&
         distance(handPoint, elbow.point) <= Math.min(0.3, upperArmLength * 2.2)
       : reliableHandLandmarks >= 3;
-  // Once two or more directly observed hand endpoints form an anatomically
-  // plausible cluster, that cluster itself is the blade. The wrist remains a
-  // support/continuity anchor but is not averaged into the cursor position:
-  // doing so pulled a downward-facing hand's blade back toward the forearm and
-  // forced the real hand out of frame to reach fruit near the lower edge.
+  // The farthest validated, directly observed hand endpoint is the blade. The
+  // wrist remains a support/continuity anchor but is not averaged into the
+  // cursor or used to project any imaginary fingertip/tool beyond the hand.
   const bladeUsesHandCluster =
     handAccepted && (wrist.point === null || handNearWrist || handDistalToElbow);
   const bladePoint = bladeUsesHandCluster ? handPoint : wrist.point;
   const bladeLandmarkConfidence = handAccepted
     ? bladeUsesHandCluster
-      ? mean(reliableHandObservations.map(({ confidence }) => confidence))
+      ? observedDistalHand.confidence
       : wrist.confidence
     : wrist.confidence;
   const confidences = [shoulder.confidence, elbow.confidence, rawWrist.confidence];

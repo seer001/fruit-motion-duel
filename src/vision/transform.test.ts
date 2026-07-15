@@ -10,6 +10,7 @@ import {
   mapCalibratedPointToLane,
   mapNormalizedPoint,
   mirrorNormalizedPoint,
+  normalizeActiveHandPoint,
   normalizeBodyPoint,
   unmapViewportPoint,
 } from './transform';
@@ -121,8 +122,49 @@ describe('body-relative lane mapping', () => {
     expect(lanePoint.x).toBeCloseTo(0.43);
     expect(lanePoint.y).toBeCloseTo(DEFAULT_VERTICAL_PADDING);
     const calibratedPoint = mapCalibratedPointToLane({ x: 0.45, y: 0.2 }, profile);
-    expect(calibratedPoint.x).toBeCloseTo(0.43);
+    expect(calibratedPoint.x).toBeCloseTo(0.34);
     expect(calibratedPoint.y).toBeCloseTo(DEFAULT_VERTICAL_PADDING);
+  });
+
+  it('centres horizontal control on the active shoulder to reduce cross-body reach', () => {
+    const rightShoulder = { x: 0.35, y: 0.4 };
+    const normalized = normalizeActiveHandPoint(rightShoulder, profile);
+    expect(normalized.x).toBeCloseTo(0);
+    expect(normalized.y).toBeCloseTo(0);
+    const mappedShoulder = mapCalibratedPointToLane(rightShoulder, profile);
+    expect(mappedShoulder.x).toBeCloseTo(0.25);
+    expect(mappedShoulder.y).toBeCloseTo(0.5);
+
+    // With the old torso-centred mapping this point was the lane centre. It is
+    // now already well into the left half, so a right hand can reach inward
+    // fruit near the torso instead of crossing all the way past the left shoulder.
+    expect(mapCalibratedPointToLane({ x: 0.25, y: 0.4 }, profile).x).toBeCloseTo(0.16);
+
+    const leaningAnchors = {
+      shoulderCenter: { x: 0.3, y: 0.4 },
+      torsoCenter: { x: 0.25, y: 0.5 },
+    };
+    expect(
+      mapCalibratedPointToLane({ x: 0.4, y: 0.4 }, profile, leaningAnchors).x,
+    ).toBeCloseTo(0.25);
+  });
+
+  it('mirrors the active-shoulder origin for a configured left hand', () => {
+    const leftHandProfile: CalibrationProfile = {
+      ...profile,
+      participantId: 'player-2',
+      lane: 'right',
+      activeHand: 'left',
+      shoulderCenter: { x: 0.75, y: 0.4 },
+      torsoCenter: { x: 0.75, y: 0.5 },
+    };
+    const leftShoulder = { x: 0.65, y: 0.4 };
+
+    const normalized = normalizeActiveHandPoint(leftShoulder, leftHandProfile);
+    expect(normalized.x).toBeCloseTo(0);
+    expect(normalized.y).toBeCloseTo(0);
+    expect(mapCalibratedPointToLane(leftShoulder, leftHandProfile)).toEqual({ x: 0.75, y: 0.5 });
+    expect(mapCalibratedPointToLane({ x: 0.75, y: 0.4 }, leftHandProfile).x).toBeCloseTo(0.84);
   });
 
   it('clamps extreme reaches to the lane instead of crossing players', () => {
@@ -162,7 +204,7 @@ describe('body-relative lane mapping', () => {
     const handOneTorsoBelowShoulder = { x: 0.25, y: 0.6 };
     const mapped = mapCalibratedPointToArena(handOneTorsoBelowShoulder, profile);
 
-    expect(mapped.x).toBeCloseTo(0.5);
+    expect(mapped.x).toBeCloseTo(0.32);
     expect(mapped.y).toBeCloseTo(1 - DEFAULT_VERTICAL_PADDING);
   });
 });

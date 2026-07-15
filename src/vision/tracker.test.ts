@@ -60,6 +60,19 @@ function withLeftHand(observation: PoseObservation, x: number, y = 0.42): PoseOb
   return observation;
 }
 
+function withCrossBodyRightHand(
+  observation: PoseObservation,
+  x: number,
+  y = 0.4,
+): PoseObservation {
+  observation.landmarks[14] = landmark(x + 0.07, y + 0.05, 0.08);
+  observation.landmarks[16] = landmark(x + 0.02, y + 0.02, 0.08);
+  for (const index of [18, 20, 22]) {
+    observation.landmarks[index] = landmark(x, y, 0.9);
+  }
+  return observation;
+}
+
 /** Mimics two small upper bodies in a wide, low-detail camera frame. */
 function wideShotPose(
   centerX: number,
@@ -401,6 +414,29 @@ describe('TwoPlayerTracker', () => {
     expect(frame.players[0].wrists.left.point).toBeNull();
     expect(frame.players[0].arms.left?.hand.reliableLandmarkCount).toBe(3);
     expect(frame.players[0].activeWrist).not.toBeNull();
+  });
+
+  it('keeps a right-hand blade while it reaches inward and its elbow and wrist are occluded', () => {
+    const rightHandBindings: [PlayerTrackBinding, PlayerTrackBinding] = [
+      { participantId: 'red', lane: 'left', activeHand: 'right' },
+      bindings[1],
+    ];
+    const tracker = new TwoPlayerTracker(rightHandBindings, {
+      mirrored: false,
+      acquisitionFrames: 1,
+    });
+    tracker.update([pose(0.25, 'red-start'), pose(0.75, 'blue-start')], 0);
+
+    const frame = tracker.update(
+      [withCrossBodyRightHand(pose(0.25, 'red-cross-body'), 0.24), pose(0.75, 'blue-live')],
+      33,
+    );
+
+    expect(frame.players[0].state).toBe('tracking');
+    expect(frame.players[0].wrists.right.point).toBeNull();
+    expect(frame.players[0].arms.right?.hand.reliableLandmarkCount).toBe(3);
+    expect(frame.players[0].activeWrist?.x).toBeCloseTo(0.24);
+    expect(frame.players[0].confidence).toBeGreaterThanOrEqual(0.55);
   });
 
   it('uses stable multi-joint body proportions when detection order reverses', () => {

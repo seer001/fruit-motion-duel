@@ -394,9 +394,9 @@ export function calibrationScreen(
   return `
     <p class="eyebrow">PLAYER CALIBRATION · ${escapeHtml(options.halfLabel)}</p>
     <h2>${players.length === 1 ? '站在鏡頭中央' : '站進自己的顏色區域'}</h2>
-    <p class="lead">正面朝向鏡頭並保持頭部與雙肩清楚入鏡。${calibrationFlowCopy}接著讓主手自然垂下，再緩慢舉至肩高。大型手部圓環以拇指／食指／小指末端群集定位；肩膀上下約一個軀幹長即可涵蓋遊戲上下緣，不必把手伸出鏡頭。</p>
+    <p class="lead">正面朝向鏡頭並保持頭部與雙肩清楚入鏡。${calibrationFlowCopy}接著讓主手自然垂下，再緩慢舉至肩高。大型手部圓環定位在拇指／食指／小指中離手臂最遠的當幀實測點，不向外推測手指或工具；肩膀上下約一個軀幹長即可涵蓋遊戲上下緣，不必把手伸出鏡頭。</p>
     <div class="status-cluster" style="justify-content: center">
-      <span class="chip">◎ 大圓環＝可切擊的手指末端群集</span>
+      <span class="chip">◎ 大圓環＝最外側的當幀實測手部點</span>
       <span class="chip">🔒 頭部色環＝已封存的玩家身份</span>
       <span class="chip">↕ 手留在鏡頭內即可到達上下緣</span>
       <span class="chip">👥 其他入鏡者會被辨識為觀眾並忽略</span>

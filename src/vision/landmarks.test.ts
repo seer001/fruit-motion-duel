@@ -108,7 +108,7 @@ describe('multi-joint pose analysis', () => {
     const arm = getArmObservation(observation, 'left', 0.42);
     expect(arm.hand.reliableLandmarkCount).toBe(2);
     expect(arm.bladePoint).toEqual(arm.hand.point);
-    expect(arm.bladePoint).not.toBeNull();
+    expect(arm.bladePoint).toEqual({ x: 0.24, y: 0.33 });
   });
 
   it('does not infer a phantom wrist from visible shoulder and elbow', () => {
@@ -132,17 +132,42 @@ describe('multi-joint pose analysis', () => {
     const arm = getArmObservation(observation, 'left', 0.42);
     expect(arm.wrist.point).toBeNull();
     expect(arm.hand.reliableLandmarkCount).toBe(3);
-    expect(arm.hand.point).not.toBeNull();
+    expect(arm.hand.point).toEqual({ x: 0.24, y: 0.33 });
     expect(arm.bladePoint).toEqual(arm.hand.point);
   });
 
-  it('uses the directly observed hand-end cluster instead of pulling toward the wrist', () => {
+  it('keeps a complete hand cluster when a cross-body elbow and wrist are occluded', () => {
+    const observation = upperBodyPose();
+    observation.landmarks[POSE_LANDMARK.rightElbow] = landmark(0.54, 0.4, 0.08);
+    observation.landmarks[POSE_LANDMARK.rightWrist] = landmark(0.47, 0.38, 0.08);
+    observation.landmarks[POSE_LANDMARK.rightPinky] = landmark(0.45, 0.37, 0.88);
+    observation.landmarks[POSE_LANDMARK.rightIndex] = landmark(0.44, 0.35, 0.9);
+    observation.landmarks[POSE_LANDMARK.rightThumb] = landmark(0.47, 0.39, 0.86);
+
+    const arm = getArmObservation(observation, 'right', 0.42);
+    expect(arm.wrist.point).toBeNull();
+    expect(arm.hand.reliableLandmarkCount).toBe(3);
+    expect(arm.bladePoint).toEqual(arm.hand.point);
+    expect(arm.bladePoint).toEqual({ x: 0.44, y: 0.35 });
+  });
+
+  it('still rejects an incomplete hand cluster when the supporting elbow is occluded', () => {
+    const observation = upperBodyPose();
+    observation.landmarks[POSE_LANDMARK.rightElbow] = landmark(0.54, 0.4, 0.08);
+    observation.landmarks[POSE_LANDMARK.rightWrist] = landmark(0.47, 0.38, 0.08);
+    observation.landmarks[POSE_LANDMARK.rightPinky] = landmark(0.45, 0.37, 0.88);
+    observation.landmarks[POSE_LANDMARK.rightIndex] = landmark(0.44, 0.35, 0.9);
+    observation.landmarks[POSE_LANDMARK.rightThumb] = landmark(0.47, 0.39, 0.08);
+
+    expect(getArmObservation(observation, 'right', 0.42).bladePoint).toBeNull();
+  });
+
+  it('uses the farthest observed hand endpoint instead of a cluster centre or wrist', () => {
     const arm = getArmObservation(upperBodyPose(), 'left', 0.42);
 
     expect(arm.wrist.point).toEqual({ x: 0.28, y: 0.36 });
     expect(arm.bladePoint).toEqual(arm.hand.point);
-    expect(arm.bladePoint?.x).toBeCloseTo(0.25);
-    expect(arm.bladePoint?.y).toBeCloseTo(0.35);
+    expect(arm.bladePoint).toEqual({ x: 0.24, y: 0.33 });
     expect(arm.bladePoint).not.toEqual(arm.wrist.point);
   });
 
@@ -156,30 +181,39 @@ describe('multi-joint pose analysis', () => {
 
     const arm = getArmObservation(observation, 'left', 0.42);
     expect(arm.bladePoint).toEqual(arm.hand.point);
-    expect(arm.bladePoint?.y).toBeCloseTo(0.74);
+    expect(arm.bladePoint).toEqual({ x: 0.3, y: 0.76 });
     expect(arm.bladePoint?.y).toBeGreaterThan(arm.wrist.point?.y ?? 1);
   });
 
-  it('rejects one jumping finger from the four-point hand center', () => {
+  it('uses one observed distal endpoint when a reliable wrist validates it at the frame edge', () => {
+    const observation = upperBodyPose();
+    observation.landmarks[POSE_LANDMARK.leftPinky] = landmark(0.25, 0.35, 0.05);
+    observation.landmarks[POSE_LANDMARK.leftThumb] = landmark(0.27, 0.38, 0.05);
+
+    const arm = getArmObservation(observation, 'left', 0.42);
+    expect(arm.hand.reliableLandmarkCount).toBe(1);
+    expect(arm.wrist.point).toEqual({ x: 0.28, y: 0.36 });
+    expect(arm.bladePoint).toEqual({ x: 0.24, y: 0.33 });
+  });
+
+  it('selects a distal inlier when one directly observed endpoint jumps', () => {
     const observation = upperBodyPose();
     observation.landmarks[POSE_LANDMARK.leftIndex] = landmark(0.94, 0.02, 0.96);
 
     const arm = getArmObservation(observation, 'left', 0.42);
     expect(arm.hand.reliableLandmarkCount).toBe(3);
-    expect(arm.bladePoint?.x).toBeCloseTo(0.27);
-    expect(arm.bladePoint?.y).toBeCloseTo(0.35);
+    expect(arm.bladePoint).toEqual({ x: 0.25, y: 0.35 });
     expect(arm.bladePoint?.x).toBeLessThan(0.3);
   });
 
-  it('keeps the three-finger palm cluster when the wrist is the jumping point', () => {
+  it('keeps the actual distal endpoint when the wrist is the jumping point', () => {
     const observation = upperBodyPose();
     observation.landmarks[POSE_LANDMARK.leftWrist] = landmark(0.86, 0.04, 0.96);
 
     const arm = getArmObservation(observation, 'left', 0.42);
     expect(arm.wrist.point).toEqual({ x: 0.86, y: 0.04 });
     expect(arm.bladePoint).toEqual(arm.hand.point);
-    expect(arm.bladePoint?.x).toBeCloseTo(0.25);
-    expect(arm.bladePoint?.y).toBeCloseTo(0.35);
+    expect(arm.bladePoint).toEqual({ x: 0.24, y: 0.33 });
   });
 
   it('does not create a blade from only one visible finger when the wrist is lost', () => {
